@@ -635,28 +635,37 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
         }
     }
 
-    @synchronized (sharedLock) {
-        [self sendDebugLog:@"download: calling lazyRegisterSession" taskId:identifier];
-        [self lazyRegisterSession];
+    // download is a void method dispatched on the custom background methodQueue.
+    // Any NSException that escapes would be converted to a JS error via Hermes JSI
+    // on this thread (not the JS thread) and crash with SIGSEGV (issue #161), so we
+    // never let one propagate out of this method.
+    @try {
+        @synchronized (sharedLock) {
+            [self sendDebugLog:@"download: calling lazyRegisterSession" taskId:identifier];
+            [self lazyRegisterSession];
 
-        // If session is not yet activated, queue the download to be executed after activation
-        // This fixes the issue where downloads don't start on fresh app installs
-        if (!isSessionActivated) {
-            DLog(identifier, @"[RNBackgroundDownloader] - [download] session not activated, queueing download");
-            [self sendDebugLog:@"download: session not activated, queueing download" taskId:identifier];
-            __weak RNBackgroundDownloader *weakSelf = self;
-            dispatch_block_t downloadBlock = ^{
-                RNBackgroundDownloader *strongSelf = weakSelf;
-                if (strongSelf) {
-                    [strongSelf executeDownloadWithRequest:request identifier:identifier url:url destination:destination metadata:metadata compressValue:compressValue];
-                }
-            };
-            [pendingDownloads addObject:downloadBlock];
-            return;
+            // If session is not yet activated, queue the download to be executed after activation
+            // This fixes the issue where downloads don't start on fresh app installs
+            if (!isSessionActivated) {
+                DLog(identifier, @"[RNBackgroundDownloader] - [download] session not activated, queueing download");
+                [self sendDebugLog:@"download: session not activated, queueing download" taskId:identifier];
+                __weak RNBackgroundDownloader *weakSelf = self;
+                dispatch_block_t downloadBlock = ^{
+                    RNBackgroundDownloader *strongSelf = weakSelf;
+                    if (strongSelf) {
+                        [strongSelf executeDownloadWithRequest:request identifier:identifier url:url destination:destination metadata:metadata compressValue:compressValue];
+                    }
+                };
+                [pendingDownloads addObject:downloadBlock];
+                return;
+            }
+
+            [self sendDebugLog:@"download: session activated, executing download" taskId:identifier];
+            [self executeDownloadWithRequest:request identifier:identifier url:url destination:destination metadata:metadata compressValue:compressValue];
         }
-
-        [self sendDebugLog:@"download: session activated, executing download" taskId:identifier];
-        [self executeDownloadWithRequest:request identifier:identifier url:url destination:destination metadata:metadata compressValue:compressValue];
+    } @catch (NSException *exception) {
+        DLog(identifier, @"[RNBackgroundDownloader] - [download] error: %@", exception.reason);
+        [self sendDebugLog:[NSString stringWithFormat:@"download: ERROR - %@", exception.reason] taskId:identifier];
     }
 }
 
