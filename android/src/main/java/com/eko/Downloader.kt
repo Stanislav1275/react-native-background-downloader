@@ -36,6 +36,7 @@ class Downloader(private val context: Context, private val storageManager: com.e
   // Service for background resumable downloads
   private var downloadService: ResumableDownloadService? = null
   private var serviceBound = false
+  private var pendingDownloadListener: ResumableDownloader.DownloadListener? = null
   private val pendingServiceOperations = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
 
   // Track which config IDs are using resumable downloads (paused state)
@@ -57,6 +58,8 @@ class Downloader(private val context: Context, private val storageManager: com.e
       downloadService = binder.getService()
       serviceBound = true
       RNBackgroundDownloaderModuleImpl.logD(TAG, "ResumableDownloadService connected")
+
+      pendingDownloadListener?.let { downloadService?.setDownloadListener(it) }
 
       // Execute any pending operations
       var operation = pendingServiceOperations.poll()
@@ -90,7 +93,20 @@ class Downloader(private val context: Context, private val storageManager: com.e
   )
 
   init {
-    bindToService()
+    // Deliberately NOT binding here.
+    //
+    // bindService(..., BIND_AUTO_CREATE) at construction creates ResumableDownloadService on
+    // every app start, whether or not anything is downloading, and a bound service pins the
+    // process at service adj (measured: oom cur=501) instead of letting it go cached. Android
+    // only delivers TRIM_MEMORY_BACKGROUND/MODERATE/COMPLETE to cached processes, so the app
+    // never got a trim callback in the background and never released what a trim releases:
+    // measured on the host app, 40 pages of a chapter, Graphics 138 MB still held 45s after
+    // HOME and dropping to 3 MB the moment TRIM_MEMORY_MODERATE was delivered by hand. It is
+    // also what defeated this service's own stopServiceIfIdle(): stopSelf() does nothing while
+    // a client is bound.
+    //
+    // executeWhenServiceReady() binds on demand, so every path that actually needs the service
+    // still gets it.
     // Load persisted paused downloads
     storageManager?.let {
       val loadedPaused = it.loadPausedDownloads()
@@ -103,6 +119,17 @@ class Downloader(private val context: Context, private val storageManager: com.e
   private fun bindToService() {
     val intent = Intent(context, ResumableDownloadService::class.java)
     context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+  }
+
+  /**
+   * Drop the binding once nothing is downloading, so the process can fall back to a cached
+   * state and receive the background trim callbacks that release graphics memory.
+   */
+  fun unbindServiceIfIdle() {
+    if (!serviceBound) return
+    if (downloadService?.hasActiveWork() != false) return
+    unbindService()
+    downloadService = null
   }
 
   fun unbindService() {
@@ -126,7 +153,12 @@ class Downloader(private val context: Context, private val storageManager: com.e
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       UIDTDownloadJobService.downloadListener = listener
     }
-    executeWhenServiceReady {
+    // Remembered rather than pushed through executeWhenServiceReady: this is called from
+    // initialize() on every app start, and binding just to hand over a listener is what kept
+    // the service alive for sessions that never download anything. onServiceConnected applies
+    // it as soon as something does bind.
+    pendingDownloadListener = listener
+    if (serviceBound) {
       downloadService?.setDownloadListener(listener)
     }
   }

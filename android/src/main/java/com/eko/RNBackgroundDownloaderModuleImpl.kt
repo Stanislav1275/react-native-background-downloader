@@ -244,6 +244,9 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
         eventEmitter.emitComplete(id, location, bytesDownloaded, bytesTotal)
         cleanupDownloadState(id)
       }
+      // Release the service binding once nothing is downloading: while it is held, the process
+      // stays at service adj and never receives the platform's background trim callbacks.
+      downloader.unbindServiceIfIdle()
     }
 
     override fun onError(id: String, error: String, errorCode: Int) {
@@ -253,6 +256,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
         eventEmitter.emitFailed(id, error, errorCode)
         cleanupDownloadState(id)
       }
+      downloader.unbindServiceIfIdle()
     }
   }
 

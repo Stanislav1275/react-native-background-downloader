@@ -416,6 +416,13 @@ class ResumableDownloadService : Service() {
     wakeLock = null
   }
 
+  /**
+   * Whether the service still has work. Used by [Downloader] to decide when it can drop its
+   * binding: while a client is bound, stopServiceIfIdle()'s stopSelf() is a no-op and the
+   * process stays at service adj, out of reach of the platform's background trim callbacks.
+   */
+  fun hasActiveWork(): Boolean = activeDownloads.isNotEmpty()
+
   private fun stopServiceIfIdle() {
     // Check if there are any active or paused downloads
     val hasActiveDownloads = activeDownloads.isNotEmpty()
