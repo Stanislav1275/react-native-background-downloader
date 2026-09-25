@@ -79,3 +79,40 @@ Option 2 is safer (matches old working behavior), Option 1 is more complete.
 The app uses `KeshaTaskFactory` (`model/infrastructure/kesha-task-factory.ts`) and calls `getExistingTasks()` via `restoreActiveTasks()` in `DownloadManager`. With Fix 1 applied, active ResumableDownloader downloads (Android 11 fallback, Android 16+) will now appear in restore.
 
 **Potential behavior change:** `restoreActiveTasks()` will now see previously invisible active tasks. Ensure session restore handles `state = TASK_RUNNING` tasks correctly (not just `TASK_SUSPENDED`). Review `TitleDownloadSession.restore()` to confirm it doesn't assume restored tasks are always paused.
+
+---
+
+## 🔴 Throttling & completion live in app JS, not in native (2026-09-25)
+
+**Concern:** chapter-level orchestration of downloads is in the app's JS thread
+(`app/fsd/features/chapter-downloader/model/download-manager.ts`), so downloads cannot be reliably
+continued/finished when the app is backgrounded (JS suspended) or killed. Not verified on a device yet —
+this is a code-reading analysis.
+
+**What is JS-only today:**
+
+| Piece | Where | What breaks when JS isn't running |
+|---|---|---|
+| Chapter queue, `MAX_CONCURRENT_CHAPTERS = 6` + `pump()` | app `download-manager.ts` (in-memory `queue`) | Queued chapters never start after the running ones finish; on kill the queue is lost entirely. The "6" itself has no measurement behind it (commit `68006d16`, "fix: try fix"). |
+| Chapter completion (counting `group.tasks[].state`) | app `KeshaChapterDownloader` | Native may finish every image in background, but `status: 'downloaded'` + `saveChapterOfflineData` are written only by JS → chapter stays `pending` forever (downloaded-chapters screen shows it as not downloaded → "Повторить"). |
+| Image retries `MAX_IMAGE_RETRIES = 2` | app `KeshaChapterDownloader` | No retry in background. |
+| Stall watchdog `STALL_TIMEOUT_MS` (3 min, `setTimeout`) | app `KeshaChapterDownloader` | Timer doesn't fire while JS is suspended. |
+| Grouping (`groupingApi` / `GroupTask`) | lib `src/GroupTask.ts` — JS, not native | Group state is not persisted; nothing survives a process death. |
+| Restore on launch | — | App no longer calls `getExistingDownloadTasks()` at all (the "App Integration Notes" above point to the old `fsd/features/download/` path — outdated). |
+
+Native today only throttles *images* (Android: `maxParallelDownloads` → UIDT on 14+, hard pool of 3 on ≤13;
+iOS: `HTTPMaximumConnectionsPerHost`), so the real cap is up to 6 chapters × up to 6 images in parallel.
+
+**Direction (to discuss):**
+1. Native, persisted queue for groups: JS enqueues all groups at once (`maxConcurrentGroups`), native starts
+   the next one itself when a group settles — works in background / after restart.
+2. Native group completion + persisted per-group result (DONE / FAILED image ids), native retry of failed images
+   (`maxRetries`) and native stall timeout.
+3. On app launch: reconcile — JS reads persisted group results (`getExistingDownloadTasks` / new `getGroups()`),
+   flips chapters `pending → downloaded/error`, writes offline data for groups that finished while JS was dead.
+4. Single connection budget instead of two multiplied limits (chapters × images) — measure 2 / 4 / 6 on a
+   large batch (time + timeout-error count) before picking a value.
+
+**Open questions:** iOS background `URLSession` finishes tasks but JS wakes only via
+`handleEventsForBackgroundURLSession` — does the lib surface group completion there? UIDT job per image or per
+group on Android 14+?

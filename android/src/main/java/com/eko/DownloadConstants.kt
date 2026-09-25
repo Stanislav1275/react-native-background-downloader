@@ -7,6 +7,27 @@ package com.eko
  */
 object DownloadConstants {
 
+    // ========== Background execution ==========
+
+    /**
+     * Route Android 14+ downloads through UIDT jobs. Off: a UIDT job can only be scheduled while the
+     * app is visible, but a host that feeds tasks in batches (the next chapter is queued when the
+     * previous one finishes) keeps scheduling from the background. There the scheduling fails, the
+     * fallback startForegroundService() is also disallowed from the background, the service runs as
+     * a plain started service, the process drops to cached and after ~60s the platform cuts its
+     * network (netpolicy blocked=APP_BACKGROUND) — every queued image then fails on DNS.
+     * The dataSync foreground service, started while the user taps "download", stays foreground
+     * for the whole batch (see ResumableDownloadService.IDLE_STOP_GRACE_MS) instead.
+     */
+    const val USE_UIDT_JOBS = false
+
+    /**
+     * How long ResumableDownloadService stays foreground after its last download settles. Hosts
+     * enqueue the next batch right after the previous one completes; dropping foreground in that
+     * gap means the next start happens from the background, where it is no longer allowed.
+     */
+    const val IDLE_STOP_GRACE_MS = 30_000L
+
     // ========== Network Timeouts ==========
 
     /** Timeout for establishing HTTP connection (milliseconds) */

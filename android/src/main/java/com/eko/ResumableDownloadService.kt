@@ -8,7 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.ConcurrentHashMap
@@ -77,6 +79,10 @@ class ResumableDownloadService : Service() {
 
   private val binder = LocalBinder()
   @Volatile private var isForeground = false
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private val idleStopRunnable = Runnable { stopNowIfIdle() }
+
+  fun isInForeground(): Boolean = isForeground
   @Volatile private var lastNotificationUpdate = 0L
   private val activeDownloads = ConcurrentHashMap<String, DownloadJob>()
   private var wakeLock: PowerManager.WakeLock? = null
@@ -262,6 +268,7 @@ class ResumableDownloadService : Service() {
 
   override fun onDestroy() {
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Service destroyed")
+    mainHandler.removeCallbacks(idleStopRunnable)
     releaseWakeLock()
     isForeground = false
     super.onDestroy()
@@ -295,6 +302,7 @@ class ResumableDownloadService : Service() {
     // Start foreground service if not already — once, not per task: this ran for every image of
     // every chapter (an AMS round-trip plus a notification build each time), largely on the main
     // thread when the operations queued before binding are flushed in onServiceConnected.
+    mainHandler.removeCallbacks(idleStopRunnable)
     if (!isForeground) startForegroundWithNotification()
     acquireWakeLock()
 
@@ -461,13 +469,23 @@ class ResumableDownloadService : Service() {
    */
   fun hasActiveWork(): Boolean = activeDownloads.isNotEmpty()
 
-  private fun stopServiceIfIdle() {
-    // Check if there are any active or paused downloads
-    val hasActiveDownloads = activeDownloads.isNotEmpty()
-    val hasPausedInResumable = activeDownloads.keys.any { resumableDownloader.getState(it) != null }
+  private fun hasWork(): Boolean =
+    activeDownloads.isNotEmpty() || activeDownloads.keys.any { resumableDownloader.getState(it) != null }
 
-    if (!hasActiveDownloads && !hasPausedInResumable) {
-      RNBackgroundDownloaderModuleImpl.logD(TAG, "No active downloads, stopping service")
+  /** Defers the actual stop by IDLE_STOP_GRACE_MS — see DownloadConstants for why. */
+  private fun stopServiceIfIdle() {
+    if (hasWork()) {
+      RNBackgroundDownloaderModuleImpl.logD(TAG, "Service has active downloads, keeping alive")
+      updateNotification()
+      return
+    }
+    mainHandler.removeCallbacks(idleStopRunnable)
+    mainHandler.postDelayed(idleStopRunnable, DownloadConstants.IDLE_STOP_GRACE_MS)
+  }
+
+  private fun stopNowIfIdle() {
+    if (!hasWork()) {
+      RNBackgroundDownloaderModuleImpl.logD(TAG, "No active downloads for ${DownloadConstants.IDLE_STOP_GRACE_MS}ms, stopping service")
       releaseWakeLock()
       stopForeground(STOP_FOREGROUND_REMOVE)
       isForeground = false

@@ -355,8 +355,8 @@ class Downloader(private val context: Context, private val storageManager: com.e
     listener: ResumableDownloader.DownloadListener,
     metadata: String = "{}"
   ) {
-    // On Android 14+, use UIDT jobs for better background execution
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+    // On Android 14+, use UIDT jobs — disabled, see DownloadConstants.USE_UIDT_JOBS
+    if (DownloadConstants.USE_UIDT_JOBS && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       // Set the listener for UIDT job callbacks
       UIDTDownloadJobService.downloadListener = listener
 
@@ -384,8 +384,13 @@ class Downloader(private val context: Context, private val storageManager: com.e
     // On Android < 14 or if UIDT fails, use foreground service
     // First, ensure the service is started as a foreground service
     // Use a no-op action to just wake up the service
+    // Already foreground: nothing to (re)start — and from the background the call below would be
+    // refused anyway (mAllowStartForeground false), which is exactly when later batches arrive.
+    val alreadyForeground = downloadService?.isInForeground() == true
     val startIntent = Intent(context, ResumableDownloadService::class.java)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    if (alreadyForeground) {
+      // no-op
+    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       try {
         context.startForegroundService(startIntent)
       } catch (e: Exception) {
