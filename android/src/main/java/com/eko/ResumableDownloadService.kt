@@ -12,8 +12,9 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * A foreground service that manages resumable downloads in the background.
@@ -27,6 +28,36 @@ class ResumableDownloadService : Service() {
 
     // Notification group for grouping all download notifications together
     private const val NOTIFICATION_GROUP_KEY = "com.eko.DOWNLOAD_GROUP"
+
+    /** Minimum gap between summary-notification refreshes; every task begin/finish asked for one. */
+    private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 1000L
+
+    /**
+     * Bounded pool for all resumable downloads of this service. Process-wide rather than per
+     * service instance so setMaxParallelDownloads() works before the service is bound, and so the
+     * limit survives the service being stopped and recreated between batches. Idle threads time out.
+     */
+    private val downloadPool: ThreadPoolExecutor = ThreadPoolExecutor(
+      DownloadConstants.DOWNLOAD_THREAD_POOL_SIZE,
+      DownloadConstants.DOWNLOAD_THREAD_POOL_SIZE,
+      30L,
+      TimeUnit.SECONDS,
+      LinkedBlockingQueue()
+    ).apply { allowCoreThreadTimeOut(true) }
+
+    fun setMaxParallelDownloads(max: Int) {
+      val size = max.coerceAtLeast(1)
+      synchronized(downloadPool) {
+        // Core may never exceed max: grow max first, shrink core first.
+        if (size >= downloadPool.maximumPoolSize) {
+          downloadPool.maximumPoolSize = size
+          downloadPool.corePoolSize = size
+        } else {
+          downloadPool.corePoolSize = size
+          downloadPool.maximumPoolSize = size
+        }
+      }
+    }
 
     // Action constants for Intent
     const val ACTION_START_DOWNLOAD = "com.eko.action.START_DOWNLOAD"
@@ -45,7 +76,8 @@ class ResumableDownloadService : Service() {
   }
 
   private val binder = LocalBinder()
-  private val executorService: ExecutorService = Executors.newFixedThreadPool(DownloadConstants.DOWNLOAD_THREAD_POOL_SIZE)
+  @Volatile private var isForeground = false
+  @Volatile private var lastNotificationUpdate = 0L
   private val activeDownloads = ConcurrentHashMap<String, DownloadJob>()
   private var wakeLock: PowerManager.WakeLock? = null
   private var listener: ResumableDownloader.DownloadListener? = null
@@ -59,7 +91,7 @@ class ResumableDownloadService : Service() {
   private val lastProgressLogTime = ConcurrentHashMap<String, Long>()
 
   // Shared ResumableDownloader instance
-  val resumableDownloader = ResumableDownloader()
+  val resumableDownloader = ResumableDownloader(downloadPool)
 
   inner class LocalBinder : Binder() {
     fun getService(): ResumableDownloadService = this@ResumableDownloadService
@@ -231,7 +263,7 @@ class ResumableDownloadService : Service() {
   override fun onDestroy() {
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Service destroyed")
     releaseWakeLock()
-    executorService.shutdownNow()
+    isForeground = false
     super.onDestroy()
   }
 
@@ -260,8 +292,10 @@ class ResumableDownloadService : Service() {
   ) {
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Starting download: $id from byte $startByte")
 
-    // Start foreground service if not already
-    startForegroundWithNotification()
+    // Start foreground service if not already — once, not per task: this ran for every image of
+    // every chapter (an AMS round-trip plus a notification build each time), largely on the main
+    // thread when the operations queued before binding are flushed in onServiceConnected.
+    if (!isForeground) startForegroundWithNotification()
     acquireWakeLock()
 
     // Increment generation counter for this download ID
@@ -337,6 +371,7 @@ class ResumableDownloadService : Service() {
       } else {
         startForeground(DownloadConstants.NOTIFICATION_ID, notification)
       }
+      isForeground = true
     } catch (e: Exception) {
       RNBackgroundDownloaderModuleImpl.logE(TAG, "Failed to start foreground service: ${e.message}")
     }
@@ -388,6 +423,9 @@ class ResumableDownloadService : Service() {
   }
 
   private fun updateNotification() {
+    val now = System.currentTimeMillis()
+    if (now - lastNotificationUpdate < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) return
+    lastNotificationUpdate = now
     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.notify(DownloadConstants.NOTIFICATION_ID, createNotification())
   }
@@ -432,6 +470,7 @@ class ResumableDownloadService : Service() {
       RNBackgroundDownloaderModuleImpl.logD(TAG, "No active downloads, stopping service")
       releaseWakeLock()
       stopForeground(STOP_FOREGROUND_REMOVE)
+      isForeground = false
       stopSelf()
     } else {
       RNBackgroundDownloaderModuleImpl.logD(TAG, "Service has active downloads, keeping alive")

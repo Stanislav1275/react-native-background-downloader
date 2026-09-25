@@ -7,14 +7,20 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
  * A resumable downloader that supports pause/resume functionality using HTTP Range headers.
  * This is used as a fallback when the standard DownloadManager doesn't support pause/resume.
+ *
+ * @param executor Runs the download bodies. Null = a dedicated thread per download, which is only
+ * safe when the caller already caps concurrency (UIDT jobs, one download per job). The foreground
+ * service passes a bounded pool: without it every started task opened its own connection at once —
+ * a few hundred parallel HTTP streams on "download all", starving the app's own requests.
  */
-class ResumableDownloader {
+class ResumableDownloader(private val executor: Executor? = null) {
 
   companion object {
     private const val TAG = "ResumableDownloader"
@@ -113,12 +119,34 @@ class ResumableDownloader {
 
     activeDownloads[id] = state
 
-    val currentSessionId = state.sessionId.get()
-    val thread = Thread {
-      downloadWithResume(state, listener, currentSessionId)
+    launch(state, listener, state.sessionId.get())
+  }
+
+  /**
+   * Runs the download body on [executor] (queued behind the pool limit) or a dedicated thread.
+   * A task that is paused/cancelled while still queued bumps the session id, so when it finally
+   * runs executeDownload bails out at its first session check without touching the network.
+   */
+  private fun launch(state: DownloadState, listener: DownloadListener, sessionId: Long) {
+    if (executor == null) {
+      val thread = Thread { downloadWithResume(state, listener, sessionId) }
+      state.thread = thread
+      thread.start()
+      return
     }
-    state.thread = thread
-    thread.start()
+    executor.execute {
+      val current = Thread.currentThread()
+      state.thread = current
+      try {
+        downloadWithResume(state, listener, sessionId)
+      } finally {
+        if (state.thread === current) state.thread = null
+        // A redirect swaps in a copied state (copyWithUrl) that inherited this thread.
+        activeDownloads[state.id]?.let { if (it.thread === current) it.thread = null }
+        // Pool threads are reused: don't let a late pause/cancel interrupt leak into the next task.
+        Thread.interrupted()
+      }
+    }
   }
 
   fun pause(id: String): Boolean {
@@ -162,11 +190,7 @@ class ResumableDownloader {
     val currentSessionId = state.sessionId.get()
     state.isPaused.set(false)
 
-    val thread = Thread {
-      downloadWithResume(state, listener, currentSessionId)
-    }
-    state.thread = thread
-    thread.start()
+    launch(state, listener, currentSessionId)
 
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Resuming download: $id from ${state.bytesDownloaded.get()} bytes (session $currentSessionId)")
     return true

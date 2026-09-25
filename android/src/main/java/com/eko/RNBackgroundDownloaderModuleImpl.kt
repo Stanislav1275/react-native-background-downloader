@@ -112,6 +112,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   // Storage manager for persistent state
   private val storageManager = StorageManager(reactContext, NAME)
 
+  private val compressLock = Any()
   private val cachedExecutorPool: ExecutorService = Executors.newCachedThreadPool()
   private val fixedExecutorPool: ExecutorService = Executors.newFixedThreadPool(1)
   private val downloader: Downloader
@@ -233,14 +234,20 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
     override fun onComplete(id: String, location: String, bytesDownloaded: Long, bytesTotal: Long) {
       progressReporter.clearPendingReport(id)
-      synchronized(sharedLock) {
-        // Guard: stopTask may have already cleaned up this task — skip emit to avoid firing
-        // onDone on a task that was intentionally stopped.
+      // Guard: stopTask may have already cleaned up this task — skip emit to avoid firing
+      // onDone on a task that was intentionally stopped.
+      val compressValue = synchronized(sharedLock) {
         if (!configIdToMetadata.containsKey(id)) return
-        val compressValue = configIdToCompressValue[id] ?: 0f
-        if (compressValue > 0f && compressValue < 1f) {
-          compressImage(location, compressValue)
-        }
+        configIdToCompressValue[id] ?: 0f
+      }
+      // Outside sharedLock: a full-page decode + JPEG encode takes hundreds of ms, and every
+      // download() call from JS takes sharedLock on the native-modules thread — the same thread
+      // that dispatches the app's fetch() calls. Holding it here froze networking app-wide.
+      if (compressValue > 0f && compressValue < 1f) {
+        compressImage(location, compressValue)
+      }
+      synchronized(sharedLock) {
+        if (!configIdToMetadata.containsKey(id)) return
         eventEmitter.emitComplete(id, location, bytesDownloaded, bytesTotal)
         cleanupDownloadState(id)
       }
@@ -291,6 +298,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       com.eko.uidt.UIDTJobManager.setMaxConcurrentJobs(max)
     }
+    // Android < 14 (and UIDT scheduling failures) run through the foreground service's pool.
+    ResumableDownloadService.setMaxParallelDownloads(max)
   }
 
   fun setAllowsCellularAccess(allows: Boolean) {
@@ -677,12 +686,16 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     if (progressIntervalScope > 0 || progressMinBytesScope > 0) {
       val newInterval = if (progressIntervalScope > 0) progressIntervalScope.toLong() else progressReporter.getProgressInterval()
       val newMinBytes = if (progressMinBytesScope > 0) progressMinBytesScope else progressReporter.getProgressMinBytes()
-      progressReporter.configure(newInterval, newMinBytes)
-      // Sync notification update interval with progress interval for Android 14+
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        UIDTDownloadJobService.setNotificationUpdateInterval(newInterval)
+      // JS sends the global progress config with every task; only a real change is worth an
+      // MMKV write under sharedLock.
+      if (newInterval != progressReporter.getProgressInterval() || newMinBytes != progressReporter.getProgressMinBytes()) {
+        progressReporter.configure(newInterval, newMinBytes)
+        // Sync notification update interval with progress interval for Android 14+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+          UIDTDownloadJobService.setNotificationUpdateInterval(newInterval)
+        }
+        saveConfigMap()
       }
-      saveConfigMap()
     }
 
     val compressValue = if (options.hasKey("compressValue")) options.getDouble("compressValue").toFloat() else 0f
@@ -801,6 +814,17 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     // SecurityException for app-specific external storage paths. Use ResumableDownloader instead.
     if (Build.VERSION.SDK_INT >= 36) {
       logD(NAME, "Android 16+ detected: Using ResumableDownloader to avoid DownloadManager path restrictions")
+      startWithResumableDownloader()
+      return
+    }
+
+    // DownloadManager only writes to external storage; an app-internal destination (filesDir,
+    // RN/Expo document directory) is rejected with SecurityException on every enqueue. Skip the
+    // doomed binder round-trip + exception per task and go straight to the resumable path.
+    val isExternalDestination = destination.startsWith("/storage/") ||
+        destination.startsWith("/sdcard/") ||
+        destination.startsWith("/mnt/")
+    if (!isExternalDestination) {
       startWithResumableDownloader()
       return
     }
@@ -1198,7 +1222,9 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
    * Decodes JPEG/PNG/WebP via BitmapFactory, re-encodes as JPEG, overwrites file.
    * Silently skips if the file is not a valid image.
    */
-  private fun compressImage(path: String, quality: Float) {
+  private fun compressImage(path: String, quality: Float) = synchronized(compressLock) {
+    // One bitmap at a time: parallel downloads finishing together each decoded a full manga page
+    // (tens of MB as ARGB_8888), and the resulting GC pressure stalled the UI and JS threads too.
     try {
       val bitmap: Bitmap = BitmapFactory.decodeFile(path) ?: return
       val qualityInt = (quality * 100).toInt().coerceIn(1, 100)
