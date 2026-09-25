@@ -25,8 +25,10 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.ReadableType
+import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -116,6 +118,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   private val cachedExecutorPool: ExecutorService = Executors.newCachedThreadPool()
   private val fixedExecutorPool: ExecutorService = Executors.newFixedThreadPool(1)
   private val downloader: Downloader
+  private val groupQueue: GroupQueue
   private var downloadReceiver: BroadcastReceiver? = null
   private var downloadIdToConfig = mutableMapOf<Long, RNBGDTaskConfig>()
   private val configIdToDownloadId = mutableMapOf<String, Long>()
@@ -246,11 +249,13 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       if (compressValue > 0f && compressValue < 1f) {
         compressImage(location, compressValue)
       }
+      val inGroup = groupQueue.owns(id)
       synchronized(sharedLock) {
         if (!configIdToMetadata.containsKey(id)) return
-        eventEmitter.emitComplete(id, location, bytesDownloaded, bytesTotal)
+        if (!inGroup) eventEmitter.emitComplete(id, location, bytesDownloaded, bytesTotal)
         cleanupDownloadState(id)
       }
+      if (inGroup) groupQueue.onTaskSettled(id, true)
       // Release the service binding once nothing is downloading: while it is held, the process
       // stays at service adj and never receives the platform's background trim callbacks.
       downloader.unbindServiceIfIdle()
@@ -258,11 +263,13 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
     override fun onError(id: String, error: String, errorCode: Int) {
       progressReporter.clearPendingReport(id)
+      val inGroup = groupQueue.owns(id)
       synchronized(sharedLock) {
         if (!configIdToMetadata.containsKey(id)) return
-        eventEmitter.emitFailed(id, error, errorCode)
+        if (!inGroup) eventEmitter.emitFailed(id, error, errorCode)
         cleanupDownloadState(id)
       }
+      if (inGroup) groupQueue.onTaskSettled(id, false)
       downloader.unbindServiceIfIdle()
     }
   }
@@ -272,6 +279,13 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     loadConfigMap()
 
     downloader = Downloader(reactContext, storageManager)
+    groupQueue = GroupQueue(
+      reactContext,
+      startTask = { task, compress -> startGroupTask(task, compress) },
+      stopTask = { taskId -> stopTask(taskId) },
+      emit = { event, payload -> getEventEmitter()?.emit(event, jsonToWritableMap(payload)) },
+    )
+    groupQueue.restore()
   }
 
   fun getConstants(): Map<String, Any>? {
@@ -1238,11 +1252,93 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     }
   }
 
+  // ─── group queue (see GroupQueue) ─────────────────────────────────────────────
+
+  fun enqueueGroup(group: ReadableMap) {
+    ensureEventEmitterInitialized()
+    val id = group.getString("id") ?: return
+    val name = if (group.hasKey("name")) group.getString("name") ?: id else id
+    val compress = if (group.hasKey("compressValue")) group.getDouble("compressValue").toFloat() else 0f
+    val tasksArr = group.getArray("tasks") ?: return
+    val tasks = (0 until tasksArr.size()).mapNotNull { i ->
+      val t = tasksArr.getMap(i) ?: return@mapNotNull null
+      val tid = t.getString("id") ?: return@mapNotNull null
+      val url = t.getString("url") ?: return@mapNotNull null
+      val dest = t.getString("destination") ?: return@mapNotNull null
+      GroupQueue.Task(tid, url, dest, HeaderUtils.toMap(if (t.hasKey("headers")) t.getMap("headers") else null))
+    }
+    groupQueue.enqueue(id, name, tasks, compress)
+  }
+
+  fun cancelGroup(id: String) = groupQueue.cancel(id)
+
+  fun acknowledgeGroup(id: String) = groupQueue.acknowledge(id)
+
+  fun getGroups(): WritableArray = jsonToWritableArray(groupQueue.snapshots())
+
+  fun setGroupQueueConfig(config: ReadableMap) {
+    if (config.hasKey("maxConcurrentGroups")) groupQueue.maxConcurrentGroups = config.getInt("maxConcurrentGroups")
+    if (config.hasKey("maxRetries")) groupQueue.maxRetries = config.getInt("maxRetries").coerceAtLeast(0)
+    if (config.hasKey("retryDelaysMs")) {
+      val arr = config.getArray("retryDelaysMs")
+      if (arr != null && arr.size() > 0) groupQueue.retryDelaysMs = LongArray(arr.size()) { arr.getDouble(it).toLong() }
+    }
+  }
+
+  /** Starts one task of a queued group on the resumable path (foreground service). */
+  private fun startGroupTask(task: GroupQueue.Task, compressValue: Float) {
+    synchronized(sharedLock) {
+      downloader.cleanupStaleState(task.id)
+      progressReporter.clearDownloadState(task.id)
+      configIdToHeaders[task.id] = task.headers
+      configIdToMetadata[task.id] = "{}"
+      configIdToCompressValue[task.id] = compressValue
+    }
+    downloader.startResumableDownload(task.id, task.url, task.destination, task.headers, resumableDownloadListener, "{}")
+  }
+
+  private fun jsonToWritableMap(json: JSONObject): WritableMap {
+    val map = Arguments.createMap()
+    for (key in json.keys()) {
+      when (val v = json.get(key)) {
+        is JSONObject -> map.putMap(key, jsonToWritableMap(v))
+        is JSONArray -> map.putArray(key, jsonToWritableArray(v))
+        is Boolean -> map.putBoolean(key, v)
+        is Int -> map.putInt(key, v)
+        is Long -> map.putDouble(key, v.toDouble())
+        is Number -> map.putDouble(key, v.toDouble())
+        JSONObject.NULL -> map.putNull(key)
+        else -> map.putString(key, v.toString())
+      }
+    }
+    return map
+  }
+
+  private fun jsonToWritableArray(json: JSONArray): WritableArray {
+    val arr = Arguments.createArray()
+    for (i in 0 until json.length()) {
+      when (val v = json.get(i)) {
+        is JSONObject -> arr.pushMap(jsonToWritableMap(v))
+        is JSONArray -> arr.pushArray(jsonToWritableArray(v))
+        is Boolean -> arr.pushBoolean(v)
+        is Int -> arr.pushInt(v)
+        is Number -> arr.pushDouble(v.toDouble())
+        else -> arr.pushString(v.toString())
+      }
+    }
+    return arr
+  }
+
   private fun onBeginDownload(configId: String, headers: WritableMap, expectedBytes: Long) {
+    if (groupQueue.owns(configId)) return
     eventEmitter.emitBegin(configId, headers, expectedBytes)
   }
 
   private fun onProgressDownload(configId: String, bytesDownloaded: Long, bytesTotal: Long) {
+    if (groupQueue.owns(configId)) {
+      groupQueue.onTaskProgress(configId)
+      return
+    }
     // Delegate all progress handling to ProgressReporter
     // It handles threshold filtering, batching, and emission
     progressReporter.reportProgress(configId, bytesDownloaded, bytesTotal)

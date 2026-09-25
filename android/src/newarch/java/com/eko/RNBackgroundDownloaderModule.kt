@@ -96,6 +96,27 @@ class RNBackgroundDownloaderModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    override fun enqueueGroup(group: com.facebook.react.bridge.ReadableMap) {
+        impl.enqueueGroup(group)
+    }
+
+    override fun cancelGroup(id: String, promise: com.facebook.react.bridge.Promise) {
+        impl.cancelGroup(id)
+        promise.resolve(null)
+    }
+
+    override fun acknowledgeGroup(id: String) {
+        impl.acknowledgeGroup(id)
+    }
+
+    override fun getGroups(promise: com.facebook.react.bridge.Promise) {
+        promise.resolve(impl.getGroups())
+    }
+
+    override fun setGroupQueueConfig(config: com.facebook.react.bridge.ReadableMap) {
+        impl.setGroupQueueConfig(config)
+    }
+
     @ReactMethod
     fun addListener(eventName: String) {
         impl.addListener(eventName)

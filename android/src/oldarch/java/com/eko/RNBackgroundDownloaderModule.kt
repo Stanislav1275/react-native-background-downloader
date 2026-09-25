@@ -161,4 +161,30 @@ class RNBackgroundDownloaderModule(reactContext: ReactApplicationContext) :
             promise.reject("ERR_GET_EXISTING_UPLOAD_TASKS", e.message, e)
         }
     }
+
+    @ReactMethod
+    fun enqueueGroup(group: com.facebook.react.bridge.ReadableMap) {
+        impl.enqueueGroup(group)
+    }
+
+    @ReactMethod
+    fun cancelGroup(id: String, promise: com.facebook.react.bridge.Promise) {
+        impl.cancelGroup(id)
+        promise.resolve(null)
+    }
+
+    @ReactMethod
+    fun acknowledgeGroup(id: String) {
+        impl.acknowledgeGroup(id)
+    }
+
+    @ReactMethod
+    fun getGroups(promise: com.facebook.react.bridge.Promise) {
+        promise.resolve(impl.getGroups())
+    }
+
+    @ReactMethod
+    fun setGroupQueueConfig(config: com.facebook.react.bridge.ReadableMap) {
+        impl.setGroupQueueConfig(config)
+    }
 }

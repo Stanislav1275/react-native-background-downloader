@@ -135,6 +135,27 @@ export interface Spec extends TurboModule {
   }>>
 
   // Event emitters (new architecture)
+  // Group queue (Android native; iOS uses the JS backend in GroupQueue.ts)
+  enqueueGroup?(group: {
+    id: string
+    name?: string
+    compressValue?: number
+    tasks: Array<{ id: string, url: string, destination: string, headers?: UnsafeObject }>
+  }): void
+  cancelGroup?(id: string): Promise<void>
+  acknowledgeGroup?(id: string): void
+  getGroups?(): Promise<Array<{
+    id: string
+    name: string
+    state: string
+    attempt: number
+    total: number
+    completed: number
+    failed: number
+    failedTaskIds: Array<string>
+  }>>
+  setGroupQueueConfig?(config: { maxConcurrentGroups?: number, maxRetries?: number, retryDelaysMs?: Array<number> }): void
+
   readonly onDownloadBegin: EventEmitter<DownloadBeginEvent>
   readonly onDownloadProgress: EventEmitter<DownloadProgressEvent[]>
   readonly onDownloadComplete: EventEmitter<DownloadCompleteEvent>

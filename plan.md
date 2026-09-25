@@ -116,3 +116,29 @@ iOS: `HTTPMaximumConnectionsPerHost`), so the real cap is up to 6 chapters × up
 **Open questions:** iOS background `URLSession` finishes tasks but JS wakes only via
 `handleEventsForBackgroundURLSession` — does the lib surface group completion there? UIDT job per image or per
 group on Android 14+?
+
+---
+
+## 🚧 Native group queue (2026-09-25)
+
+**Why:** measured on Redmi / Android 11 — the app feeds chapters one by one from JS: ~50 `download()` bridge
+calls per chapter, per-image progress/complete events back into JS, JS-side completion accounting.
+JS stalls 0.5–1.3 s on every chapter start/finish; and any JS pause (background, kill) stalls the queue.
+
+**API (fork, Android native; iOS keeps a JS implementation of the same API for now):**
+
+```ts
+groupQueue.enqueue({ id, name?, tasks: [{ id, url, destination, headers? }], compressValue? })  // one bridge call per group
+groupQueue.cancel(id): Promise<void>
+groupQueue.getAll(): Promise<GroupSnapshot[]>     // reconcile after restart
+groupQueue.acknowledge(id)                         // host recorded the result → native forgets it
+groupQueue.onState(cb) / onProgress(cb)            // group-level events only
+setConfig({ maxConcurrentGroups, groupMaxRetries, groupRetryDelaysMs })
+```
+
+**Native (Kotlin `GroupQueue`):** persisted queue (SharedPreferences, one key per group); runs at most
+`maxConcurrentGroups` groups; tasks of queued groups go through the resumable path; per-task begin/progress/
+complete events are NOT sent to JS for group tasks; group settles when every task is DONE/FAILED → failed
+tasks retried `groupMaxRetries` times with `groupRetryDelaysMs` back-off → `groupState {done|failed,
+failedTaskIds}`; next group starts natively, no JS round-trip. On module init: running groups → re-queued,
+their finished tasks kept.

@@ -2,6 +2,7 @@ import { NativeModules, Platform, TurboModuleRegistry, NativeEventEmitter, Nativ
 import { DownloadTask } from './DownloadTask'
 import { UploadTask } from './UploadTask'
 import { GroupTask } from './GroupTask'
+import { initGroupQueue, type GroupQueueNative } from './GroupQueue'
 import { Config, DownloadParams, Headers, Metadata, TaskInfo, TaskInfoNative, UploadParams, UploadTaskInfo, UploadTaskInfoNative } from './types'
 import { config, log, DEFAULT_PROGRESS_INTERVAL, DEFAULT_PROGRESS_MIN_BYTES, getNotificationTextsForNative, getNotificationImageStyleForNative, DEFAULT_NOTIFICATION_TEXTS } from './config'
 import type { Spec } from './NativeRNBackgroundDownloader'
@@ -63,6 +64,10 @@ function ensureNativeModuleInitialized (): RNBackgroundDownloaderModule & Native
 
   // Initialize event listeners after native module is ready
   initializeEventListeners()
+  initGroupQueue(RNBackgroundDownloader as unknown as GroupQueueNative & NativeModule, spec =>
+    // Headers resolved like any other task (config.headers merged in createDownloadTask).
+    createDownloadTask({ id: spec.id, url: spec.url, destination: spec.destination, headers: spec.headers })
+  )
 
   return RNBackgroundDownloader
 }
@@ -716,3 +721,6 @@ export function getNativeModule (): Spec {
 }
 
 export type * from './types'
+
+export { groupQueue } from './GroupQueue'
+export type { GroupSpec, GroupTaskSpec, GroupSnapshot, GroupState, GroupQueueConfig } from './GroupQueue'
