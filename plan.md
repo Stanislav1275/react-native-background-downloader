@@ -125,7 +125,7 @@ group on Android 14+?
 calls per chapter, per-image progress/complete events back into JS, JS-side completion accounting.
 JS stalls 0.5–1.3 s on every chapter start/finish; and any JS pause (background, kill) stalls the queue.
 
-**API (fork, Android native; iOS keeps a JS implementation of the same API for now):**
+**API (fork, native on Android and iOS):**
 
 ```ts
 groupQueue.enqueue({ id, name?, tasks: [{ id, url, destination, headers? }], compressValue? })  // one bridge call per group
@@ -142,3 +142,23 @@ complete events are NOT sent to JS for group tasks; group settles when every tas
 tasks retried `groupMaxRetries` times with `groupRetryDelaysMs` back-off → `groupState {done|failed,
 failedTaskIds}`; next group starts natively, no JS round-trip. On module init: running groups → re-queued,
 their finished tasks kept.
+
+**Native (iOS `RNBGDGroupQueue`, 2026-09-27):** same contract and events (`groupState` / `groupProgress`;
+new arch — `onGroupState` / `onGroupProgress` emitters in the Spec). Persisted in MMKV
+(`RNBackgroundDownloaderGroupQueue`, key `g:<id>`, with a monotonic `order`). Differences from Android:
+- **Background.** No FGS equivalent: once suspended, neither JS nor native timers run, and tasks created from
+  the background are discretionary. On `UIApplicationDidEnterBackgroundNotification` the whole remaining
+  queue (queued groups + groups waiting for a retry) is handed to the background `URLSession` at once
+  (`flushForBackground`, under `beginBackgroundTask`); `HTTPMaximumConnectionsPerHost` still bounds real
+  parallelism. Same flush on `URLSessionDidFinishEventsForBackgroundURLSession`, after which the system
+  completion handler is called natively (the host no longer has to call `completeHandler()`).
+- **Process death.** Background session tasks survive it, so running groups are NOT re-queued: their
+  persisted `pending` tasks are kept, and after session activation `adoptLiveTaskIds:` restarts only
+  the tasks the session no longer has. Completions delivered on relaunch settle normally.
+- `setMaxParallelDownloads` / `setAllowsCellularAccess` recreate the background session
+  (`invalidateAndCancel` → every task cancelled). They are now no-ops when the value is unchanged and
+  persisted, so `setConfig` on every app start no longer kills downloads that outlived the process.
+- `compressImageAtPath` runs outside `sharedLock`; `taskToConfigMap` is persisted coalesced (≤ 2/s)
+  instead of on every task start/finish.
+
+**Not verified yet on iOS:** S1 (bulk), S3 (background mid-batch), S4 (kill mid-batch → relaunch → adopt).

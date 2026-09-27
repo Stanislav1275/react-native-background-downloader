@@ -56,6 +56,17 @@ export type UploadFailedEvent = {
   errorCode: number
 }
 
+export type GroupSnapshotEvent = {
+  id: string
+  name: string
+  state: string
+  attempt: number
+  total: number
+  completed: number
+  failed: number
+  failedTaskIds: Array<string>
+}
+
 export interface Spec extends TurboModule {
   // Constants exported to JavaScript
   getConstants(): {
@@ -134,8 +145,7 @@ export interface Spec extends TurboModule {
     errorCode?: number | null
   }>>
 
-  // Event emitters (new architecture)
-  // Group queue (Android native; iOS uses the JS backend in GroupQueue.ts)
+  // Group queue (native on both platforms: GroupQueue.kt / RNBGDGroupQueue.mm)
   enqueueGroup?(group: {
     id: string
     name?: string
@@ -166,6 +176,11 @@ export interface Spec extends TurboModule {
   readonly onUploadProgress?: EventEmitter<UploadProgressEvent[]>
   readonly onUploadComplete?: EventEmitter<UploadCompleteEvent>
   readonly onUploadFailed?: EventEmitter<UploadFailedEvent>
+
+  // Group queue event emitters (iOS new architecture; Android emits groupState/groupProgress
+  // through RCTDeviceEventEmitter)
+  readonly onGroupState?: EventEmitter<GroupSnapshotEvent>
+  readonly onGroupProgress?: EventEmitter<GroupSnapshotEvent>
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('RNBackgroundDownloader')

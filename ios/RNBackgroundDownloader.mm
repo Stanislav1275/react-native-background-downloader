@@ -1,6 +1,7 @@
 #import "RNBackgroundDownloader.h"
 #import "RNBGDTaskConfig.h"
 #import "RNBGDUploadTaskConfig.h"
+#import "RNBGDGroupQueue.h"
 #import <MMKV/MMKV.h>
 #import <React/RCTBridge.h>
 
@@ -13,6 +14,8 @@
 #define ID_TO_UPLOAD_CONFIG_MAP_KEY @"com.eko.bguploadidmap"
 #define PROGRESS_INTERVAL_KEY @"progressInterval"
 #define PROGRESS_MIN_BYTES_KEY @"progressMinBytes"
+#define MAX_CONNECTIONS_PER_HOST_KEY @"maxConnectionsPerHost"
+#define ALLOWS_CELLULAR_ACCESS_KEY @"allowsCellularAccess"
 
 // Session configuration constants
 static const NSInteger kMaxConnectionsPerHost = 4;
@@ -65,6 +68,11 @@ static CompletionHandler storedCompletionHandler;
     NSMutableArray<dispatch_block_t> *pendingDownloads;
     // Controls whether debug logs are sent to JS
     BOOL isLogsEnabled;
+    // Native queue of download groups (see RNBGDGroupQueue)
+    RNBGDGroupQueue *groupQueue;
+    // Coalesced persistence of taskToConfigMap (see persistTaskMapSoon)
+    BOOL isTaskMapDirty;
+    BOOL isTaskMapPersistScheduled;
 
 #ifdef RCT_NEW_ARCH_ENABLED
     // Queue of events that arrived before the TurboModule event emitter callback was set.
@@ -117,6 +125,8 @@ RCT_EXPORT_MODULE();
         @"uploadProgress",
         @"uploadComplete",
         @"uploadFailed",
+        @"groupState",
+        @"groupProgress",
         @"nativeDebugLog"
     ];
 }
@@ -216,6 +226,15 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         // These APIs are available since our minimum iOS version (15.1)
         sessionConfig.shouldUseExtendedBackgroundIdleMode = YES;
         sessionConfig.allowsExpensiveNetworkAccess = YES;
+        // Applied before the session exists: changing them later means recreating the background
+        // session, which cancels every task in it.
+        int32_t persistedMaxConnections = [mmkv getInt32ForKey:MAX_CONNECTIONS_PER_HOST_KEY];
+        if (persistedMaxConnections >= 1) {
+            sessionConfig.HTTPMaximumConnectionsPerHost = persistedMaxConnections;
+        }
+        if ([mmkv containsKey:ALLOWS_CELLULAR_ACCESS_KEY]) {
+            sessionConfig.allowsCellularAccess = [mmkv getBoolForKey:ALLOWS_CELLULAR_ACCESS_KEY];
+        }
 
         sharedLock = [NSNumber numberWithInt:1];
 
@@ -255,6 +274,8 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         idToUploadLastBytesMap = [[NSMutableDictionary alloc] init];
         idsToUploadPauseSet = [[NSMutableSet alloc] init];
         lastUploadProgressReportedAt = [[NSDate alloc] init];
+
+        [self setUpGroupQueue];
 
         [self registerBridgeListener];
 
@@ -314,6 +335,20 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
             }
             [self->pendingDownloads removeAllObjects];
         }
+
+        // Group tasks that outlived the previous process keep running; only lost ones are restarted.
+        NSMutableSet<NSString *> *liveTaskIds = [NSMutableSet set];
+        @synchronized (self->sharedLock) {
+            for (NSURLSessionDownloadTask *task in downloadTasks) {
+                if (task.state != NSURLSessionTaskStateRunning && task.state != NSURLSessionTaskStateSuspended) continue;
+                RNBGDTaskConfig *config = self->taskToConfigMap[@(task.taskIdentifier)];
+                if (config.id) {
+                    [liveTaskIds addObject:config.id];
+                    self->idToTaskMap[config.id] = task;
+                }
+            }
+        }
+        [self->groupQueue adoptLiveTaskIds:liveTaskIds];
     }];
 }
 
@@ -338,6 +373,11 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
                                                   object:nil];
 
             [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(handleAppDidEnterBackground:)
+                                                  name:UIApplicationDidEnterBackgroundNotification
+                                                  object:nil];
+
+            [[NSNotificationCenter defaultCenter] addObserver:self
                                                   selector:@selector(handleBridgeHotReload:)
                                                   name:RCTJavaScriptWillStartLoadingNotification
                                                   object:nil];
@@ -358,6 +398,30 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     [self resumeTasks];
 }
 
+// Once suspended, nothing starts the next group in time (tasks created from the background are
+// discretionary), so the whole remaining queue goes to the background session now.
+- (void)handleAppDidEnterBackground:(NSNotification *)note {
+    if (![groupQueue hasWork]) {
+        [self persistTaskMapNow];
+        return;
+    }
+    __block UIBackgroundTaskIdentifier bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"RNBGDGroupQueueFlush" expirationHandler:^{
+        [[UIApplication sharedApplication] endBackgroundTask:bgTask];
+        bgTask = UIBackgroundTaskInvalid;
+    }];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self->groupQueue flushForBackground];
+        // Timers do not run while suspended: write the map before that.
+        [self persistTaskMapNow];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (bgTask != UIBackgroundTaskInvalid) {
+                [[UIApplication sharedApplication] endBackgroundTask:bgTask];
+                bgTask = UIBackgroundTaskInvalid;
+            }
+        });
+    });
+}
+
 - (void)resumeTasks {
     @synchronized (sharedLock) {
         DLog(nil, @"[RNBackgroundDownloader] - [resumeTasks]");
@@ -376,6 +440,30 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     }
 }
 
+// Serializing the whole map on every task start/finish is O(n) per call; with a whole queue handed
+// to the session (hundreds of pages) it turned into seconds of CPU. Writes are coalesced instead.
+// Losing the last write is harmless: a missing entry makes the group queue restart that task, a
+// stale one is dropped when its session task no longer exists.
+- (void)persistTaskMapSoon {
+    @synchronized (sharedLock) {
+        isTaskMapDirty = YES;
+        if (isTaskMapPersistScheduled) return;
+        isTaskMapPersistScheduled = YES;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [self persistTaskMapNow];
+    });
+}
+
+- (void)persistTaskMapNow {
+    @synchronized (sharedLock) {
+        isTaskMapPersistScheduled = NO;
+        if (!isTaskMapDirty) return;
+        isTaskMapDirty = NO;
+        [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+    }
+}
+
 - (void)removeTaskFromMap: (NSURLSessionTask *)task {
     @synchronized (sharedLock) {
         NSNumber *taskId = @(task.taskIdentifier);
@@ -383,7 +471,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         DLog(taskConfig.id, @"[RNBackgroundDownloader] - [removeTaskFromMap]");
 
         [taskToConfigMap removeObjectForKey:taskId];
-        [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+        [self persistTaskMapSoon];
 
         if (taskConfig) {
             [self -> idToTaskMap removeObjectForKey:taskConfig.id];
@@ -418,8 +506,11 @@ RCT_EXPORT_METHOD(setLogsEnabled:(BOOL)enabled) {
     // dispatch queue. Without this, Hermes is accessed from the wrong thread → SIGSEGV (#161).
     @try {
         @synchronized (sharedLock) {
-            if (max >= 1) {
+            if (max >= 1 && sessionConfig.HTTPMaximumConnectionsPerHost != max) {
                 sessionConfig.HTTPMaximumConnectionsPerHost = max;
+                [mmkv setInt32:(int32_t)max forKey:MAX_CONNECTIONS_PER_HOST_KEY];
+                // Recreating the background session cancels its tasks; hosts call setConfig on
+                // every start, so this only happens when the value really changes.
                 if (urlSession != nil) {
                     [self unregisterSession];
                     [self lazyRegisterSession];
@@ -447,7 +538,11 @@ RCT_EXPORT_METHOD(setMaxParallelDownloads:(NSInteger)max) {
     // dispatch queue. Without this, Hermes is accessed from the wrong thread → SIGSEGV (#161).
     @try {
         @synchronized (sharedLock) {
+            if (sessionConfig.allowsCellularAccess == allows) {
+                return;
+            }
             sessionConfig.allowsCellularAccess = allows;
+            [mmkv setBool:allows forKey:ALLOWS_CELLULAR_ACCESS_KEY];
             if (urlSession != nil) {
                 [self unregisterSession];
                 [self lazyRegisterSession];
@@ -527,6 +622,10 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
         return;
     }
 
+    [self startDownloadWithId:identifier url:url destination:destination headers:headers metadata:metadata compressValue:compressValue];
+}
+
+- (void)startDownloadWithId:(NSString *)identifier url:(NSString *)url destination:(NSString *)destination headers:(nullable NSDictionary *)headers metadata:(NSString *)metadata compressValue:(CGFloat)compressValue {
     NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:url]];
     // Query in the getExistingDownloadTasks function.
     [request setValue:identifier forHTTPHeaderField:@"configId"];
@@ -617,7 +716,7 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
         }];
 
         taskToConfigMap[@(task.taskIdentifier)] = taskConfig;
-        [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+        [self persistTaskMapSoon];
 
         self->idToTaskMap[identifier] = task;
         idToPercentMap[identifier] = @0.0;
@@ -1230,8 +1329,10 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 
 #pragma mark - NSURLSessionDownloadDelegate methods
 - (void)URLSession:(nonnull NSURLSession *)session downloadTask:(nonnull NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(nonnull NSURL *)location {
+    RNBGDTaskConfig *taskConfig;
+    NSError *error = nil;
     @synchronized (sharedLock) {
-        RNBGDTaskConfig *taskConfig = [self configForTask:downloadTask];
+        taskConfig = [self configForTask:downloadTask];
         if (!taskConfig) {
             [self sendDebugLog:@"didFinishDownloadingToURL: no taskConfig found" taskId:nil];
             return;
@@ -1240,16 +1341,21 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didFinishDownloadingToURL]");
         [self sendDebugLog:@"didFinishDownloadingToURL: download finished" taskId:taskConfig.id];
 
-        NSError *error = [self getServerError:downloadTask];
+        error = [self getServerError:downloadTask];
         if (!error) {
+            // Must happen before this callback returns: the system deletes `location` afterwards.
             [self saveFile:taskConfig downloadURL:location error:&error];
-
-            // Compress image after successful save if configured
-            if (!error && taskConfig.compressValue > 0.0 && taskConfig.compressValue < 1.0) {
-                [self compressImageAtPath:taskConfig.destination quality:taskConfig.compressValue];
-            }
         }
+    }
 
+    // Compress outside sharedLock: re-encoding a page takes tens of ms and would block every
+    // bridge call (download(), enqueueGroup(), ...) behind it.
+    if (!error && taskConfig.compressValue > 0.0 && taskConfig.compressValue < 1.0) {
+        [self compressImageAtPath:taskConfig.destination quality:taskConfig.compressValue];
+    }
+
+    BOOL inGroup = [groupQueue owns:taskConfig.id];
+    @synchronized (sharedLock) {
         if (error) {
             [self sendDebugLog:[NSString stringWithFormat:@"didFinishDownloadingToURL: error - %@", error.localizedDescription] taskId:taskConfig.id];
         }
@@ -1257,9 +1363,14 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         // Drop any buffered progress for this task so it cannot arrive in JS after downloadComplete
         [progressReports removeObjectForKey:taskConfig.id];
 
-        [self sendDownloadCompletionEvent:taskConfig task:downloadTask error:error];
+        if (!inGroup) {
+            [self sendDownloadCompletionEvent:taskConfig task:downloadTask error:error];
+        }
 
         [self removeTaskFromMap:downloadTask];
+    }
+    if (inGroup) {
+        [groupQueue onTaskSettled:taskConfig.id success:error == nil];
     }
 }
 
@@ -1317,6 +1428,13 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         }
 
         DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didWriteData]");
+
+        if ([groupQueue owns:taskConfig.id]) {
+            taskConfig.bytesDownloaded = bytesTotalWritten;
+            taskConfig.bytesTotal = bytesTotalExpectedToWrite;
+            [groupQueue onTaskProgress:taskConfig.id];
+            return;
+        }
 
         [self reportBeginIfNeeded:taskConfig downloadTask:downloadTask expectedBytes:bytesTotalExpectedToWrite];
         [self updateProgressIfNeeded:taskConfig bytesWritten:bytesTotalWritten bytesTotal:bytesTotalExpectedToWrite];
@@ -1396,6 +1514,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    NSString *groupTaskIdToFail = nil;
     @synchronized (sharedLock) {
         // Check if this is an upload task first
         RNBGDUploadTaskConfig *uploadTaskConfig = [self uploadConfigForTask:task];
@@ -1480,26 +1599,167 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         }
 
         // Handle failure
+        if ([groupQueue owns:taskConfig.id]) {
+            [self removeTaskFromMap:task];
+            // Settled outside sharedLock below: the queue may start the next attempt right away.
+            groupTaskIdToFail = taskConfig.id;
+        } else {
 #ifdef RCT_NEW_ARCH_ENABLED
-        [self safeEmitEvent:@"onDownloadFailed" value:@{
-            @"id": taskConfig.id,
-            @"error": [error localizedDescription],
-            @"errorCode": @(error.code)
-        }];
+            [self safeEmitEvent:@"onDownloadFailed" value:@{
+                @"id": taskConfig.id,
+                @"error": [error localizedDescription],
+                @"errorCode": @(error.code)
+            }];
 #else
-        [self sendEventWithName:@"downloadFailed" body:@{
-            @"id": taskConfig.id,
-            @"error": [error localizedDescription],
-            @"errorCode": @(error.code)
-        }];
+            [self sendEventWithName:@"downloadFailed" body:@{
+                @"id": taskConfig.id,
+                @"error": [error localizedDescription],
+                @"errorCode": @(error.code)
+            }];
 #endif
-        [self removeTaskFromMap:task];
+            [self removeTaskFromMap:task];
+        }
+    }
+    if (groupTaskIdToFail) {
+        [groupQueue onTaskSettled:groupTaskIdToFail success:NO];
     }
 }
 
 - (void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session {
     DLog(nil, @"[RNBackgroundDownloader] - [URLSessionDidFinishEventsForBackgroundURLSession]");
+    // Woken in the background: whatever the queue still holds (retries waiting on a timer that
+    // would not fire once suspended) goes to the session before the app is suspended again.
+    [groupQueue flushForBackground];
+    [self persistTaskMapNow];
+    // The group queue does not need JS to finish a batch, so the system's completion handler is
+    // called here instead of waiting for the host's completeHandler() (or the 30 s timeout).
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (storedCompletionHandler) {
+            storedCompletionHandler();
+            storedCompletionHandler = nil;
+        }
+    });
 }
+
+#pragma mark - Group queue
+
+- (void)setUpGroupQueue {
+    __weak RNBackgroundDownloader *weakSelf = self;
+    groupQueue = [[RNBGDGroupQueue alloc] initWithStartTask:^BOOL(NSDictionary *task, CGFloat compressValue) {
+        RNBackgroundDownloader *strongSelf = weakSelf;
+        if (strongSelf == nil) return NO;
+        NSString *destination = task[@"destination"];
+        if ([strongSelf getRelativeFilePathFromPath:destination] == nil) return NO;
+        NSDictionary *headers = [task[@"headers"] isKindOfClass:[NSDictionary class]] ? task[@"headers"] : nil;
+        [strongSelf startDownloadWithId:task[@"id"] url:task[@"url"] destination:destination headers:headers metadata:@"{}" compressValue:compressValue];
+        return YES;
+    } stopTask:^(NSString *taskId) {
+        [weakSelf stopTaskInternal:taskId resolve:^(id result) {} reject:^(NSString *code, NSString *message, NSError *error) {}];
+    } emit:^(NSString *event, NSDictionary *payload) {
+        RNBackgroundDownloader *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+#ifdef RCT_NEW_ARCH_ENABLED
+        NSString *name = [event isEqualToString:@"groupState"] ? @"onGroupState" : @"onGroupProgress";
+        [strongSelf safeEmitEvent:name value:payload];
+#else
+        [strongSelf sendEventWithName:event body:payload];
+#endif
+    }];
+    [groupQueue restore];
+}
+
+- (void)enqueueGroupInternal:(NSDictionary *)group {
+    [groupQueue enqueue:group];
+}
+
+- (void)cancelGroupInternal:(NSString *)groupId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        [groupQueue cancel:groupId];
+        resolve(nil);
+    } @catch (NSException *exception) {
+        reject(@"ERR_CANCEL_GROUP", exception.reason, nil);
+    }
+}
+
+- (void)setGroupQueueConfigInternal:(NSDictionary *)config {
+    if ([config[@"maxConcurrentGroups"] isKindOfClass:[NSNumber class]]) {
+        groupQueue.maxConcurrentGroups = [config[@"maxConcurrentGroups"] integerValue];
+    }
+    if ([config[@"maxRetries"] isKindOfClass:[NSNumber class]]) {
+        groupQueue.maxRetries = MAX(0, [config[@"maxRetries"] integerValue]);
+    }
+    NSArray *delays = config[@"retryDelaysMs"];
+    if ([delays isKindOfClass:[NSArray class]] && delays.count > 0) {
+        groupQueue.retryDelaysMs = delays;
+    }
+}
+
+#ifdef RCT_NEW_ARCH_ENABLED
+- (void)enqueueGroup:(JS::NativeRNBackgroundDownloader::SpecEnqueueGroupGroup &)group {
+    NSMutableArray *tasks = [NSMutableArray array];
+    auto specTasks = group.tasks();
+    for (size_t i = 0; i < specTasks.size(); i++) {
+        auto t = specTasks[i];
+        NSMutableDictionary *task = [NSMutableDictionary dictionary];
+        task[@"id"] = t.id_();
+        task[@"url"] = t.url();
+        task[@"destination"] = t.destination();
+        if (t.headers()) task[@"headers"] = (NSDictionary *)t.headers();
+        [tasks addObject:task];
+    }
+    NSMutableDictionary *spec = [NSMutableDictionary dictionary];
+    spec[@"id"] = group.id_();
+    if (group.name()) spec[@"name"] = group.name();
+    if (group.compressValue().has_value()) spec[@"compressValue"] = @(group.compressValue().value());
+    spec[@"tasks"] = tasks;
+    [self enqueueGroupInternal:spec];
+}
+
+- (void)cancelGroup:(NSString *)id resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    [self cancelGroupInternal:id resolve:resolve reject:reject];
+}
+
+- (void)acknowledgeGroup:(NSString *)id {
+    [groupQueue acknowledge:id];
+}
+
+- (void)getGroups:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    resolve([groupQueue snapshots]);
+}
+
+- (void)setGroupQueueConfig:(JS::NativeRNBackgroundDownloader::SpecSetGroupQueueConfigConfig &)config {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    if (config.maxConcurrentGroups().has_value()) dict[@"maxConcurrentGroups"] = @(config.maxConcurrentGroups().value());
+    if (config.maxRetries().has_value()) dict[@"maxRetries"] = @(config.maxRetries().value());
+    if (config.retryDelaysMs().has_value()) {
+        NSMutableArray *delays = [NSMutableArray array];
+        auto specDelays = config.retryDelaysMs().value();
+        for (size_t i = 0; i < specDelays.size(); i++) [delays addObject:@(specDelays[i])];
+        dict[@"retryDelaysMs"] = delays;
+    }
+    [self setGroupQueueConfigInternal:dict];
+}
+#else
+RCT_EXPORT_METHOD(enqueueGroup:(NSDictionary *)group) {
+    [self enqueueGroupInternal:group];
+}
+
+RCT_EXPORT_METHOD(cancelGroup:(NSString *)id resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self cancelGroupInternal:id resolve:resolve reject:reject];
+}
+
+RCT_EXPORT_METHOD(acknowledgeGroup:(NSString *)id) {
+    [groupQueue acknowledge:id];
+}
+
+RCT_EXPORT_METHOD(getGroups:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    resolve([groupQueue snapshots]);
+}
+
+RCT_EXPORT_METHOD(setGroupQueueConfig:(NSDictionary *)config) {
+    [self setGroupQueueConfigInternal:config];
+}
+#endif
 
 #pragma mark - Upload methods
 

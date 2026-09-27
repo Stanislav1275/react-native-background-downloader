@@ -1,6 +1,7 @@
 import { NativeEventEmitter, NativeModule, Platform } from 'react-native'
 import type { DownloadTask } from './DownloadTask'
 import type { Headers } from './types'
+import type { GroupSnapshotEvent } from './NativeRNBackgroundDownloader'
 
 export type GroupState = 'queued' | 'running' | 'retrying' | 'done' | 'failed' | 'canceled'
 
@@ -48,6 +49,8 @@ export interface GroupQueueNative {
   acknowledgeGroup?: (id: string) => void
   getGroups?: () => Promise<GroupSnapshot[]>
   setGroupQueueConfig?: (config: GroupQueueConfig) => void
+  onGroupState?: (handler: (s: GroupSnapshotEvent) => void) => unknown
+  onGroupProgress?: (handler: (s: GroupSnapshotEvent) => void) => unknown
 }
 
 interface Backend {
@@ -63,11 +66,17 @@ const progressListeners = new Set<Listener>()
 const emitState = (s: GroupSnapshot) => stateListeners.forEach(l => l(s))
 const emitProgress = (s: GroupSnapshot) => progressListeners.forEach(l => l(s))
 
-/** Android: the queue lives in Kotlin (GroupQueue.kt); JS only forwards calls and events. */
+/** The queue lives in native code (GroupQueue.kt / RNBGDGroupQueue.mm); JS only forwards calls and events. */
 function createNativeBackend (native: GroupQueueNative & NativeModule): Backend {
-  const emitter = new NativeEventEmitter(native)
-  emitter.addListener('groupState', emitState)
-  emitter.addListener('groupProgress', emitProgress)
+  if (Platform.OS === 'ios' && typeof native.onGroupState === 'function' && typeof native.onGroupProgress === 'function') {
+    // iOS new architecture: events come through the TurboModule's typed emitters.
+    native.onGroupState(s => emitState(s as GroupSnapshot))
+    native.onGroupProgress(s => emitProgress(s as GroupSnapshot))
+  } else {
+    const emitter = new NativeEventEmitter(native)
+    emitter.addListener('groupState', emitState)
+    emitter.addListener('groupProgress', emitProgress)
+  }
   return {
     enqueue: group => native.enqueueGroup!(group),
     cancel: id => native.cancelGroup!(id),
@@ -78,9 +87,8 @@ function createNativeBackend (native: GroupQueueNative & NativeModule): Backend 
 }
 
 /**
- * Same contract in JS on top of per-task downloads — used where the native queue isn't implemented
- * yet (iOS). Background URLSession keeps running tasks alive there; scheduling the next group still
- * needs JS, which is the documented limitation of this backend.
+ * Same contract in JS on top of per-task downloads — fallback for a native build that predates the
+ * native queue. Scheduling the next group needs JS, so the queue stalls while JS is suspended.
  */
 function createJsBackend (createTask: (spec: GroupTaskSpec) => DownloadTask): Backend {
   interface G { spec: GroupSpec, snap: GroupSnapshot, done: Set<string>, pending: Map<string, DownloadTask> }
@@ -179,7 +187,7 @@ let backend: Backend | null = null
 /** @internal wired by index.ts once the native module is initialized. */
 export function initGroupQueue (native: GroupQueueNative & NativeModule, createTask: (spec: GroupTaskSpec) => DownloadTask) {
   if (backend) return
-  backend = Platform.OS === 'android' && typeof native.enqueueGroup === 'function'
+  backend = typeof native.enqueueGroup === 'function'
     ? createNativeBackend(native)
     : createJsBackend(createTask)
 }
@@ -192,7 +200,7 @@ function getBackend (): Backend {
 /**
  * Queue of download groups (e.g. one group per manga chapter). Enqueue everything at once; the queue
  * runs `maxConcurrentGroups` groups at a time, retries failed tasks and reports group-level events only.
- * On Android the queue is native — it keeps going while JS is backgrounded or busy.
+ * The queue is native — it keeps going while JS is backgrounded or busy.
  */
 export const groupQueue = {
   enqueue: (group: GroupSpec) => getBackend().enqueue(group),
