@@ -381,6 +381,12 @@ class Downloader(private val context: Context, private val storageManager: com.e
       RNBackgroundDownloaderModuleImpl.logW(TAG, "UIDT scheduling failed, falling back to foreground service")
     }
 
+    // A new start supersedes cancels issued before it: the guard below is only for a cancel that
+    // arrives while this start waits for the service. Left in the set, an old cancel (the service
+    // was bound, so no deferred start consumed it) silently dropped every later start of the same
+    // id — a re-downloaded or resumed chapter never finished.
+    pendingCancels.remove(configId)
+
     // On Android < 14 or if UIDT fails, use foreground service
     // First, ensure the service is started as a foreground service
     // Use a no-op action to just wake up the service
