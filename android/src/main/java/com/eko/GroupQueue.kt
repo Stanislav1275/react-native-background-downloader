@@ -64,6 +64,9 @@ class GroupQueue(
 
     /** Set by a notification action while the process had no queue (it died while paused). */
     private const val KEY_PENDING_ACTION = "pending_action"
+    private const val KEY_BATCH_TOTAL = "batch_total"
+    private const val KEY_BATCH_DONE = "batch_done"
+    private const val KEY_BATCH_FAILED = "batch_failed"
     const val ACTION_RESUME = "resume"
     const val ACTION_CANCEL = "cancel"
 
@@ -78,6 +81,16 @@ class GroupQueue(
 
   /** Called (main thread) whenever [summary] may have changed. */
   @Volatile var onChanged: (() -> Unit)? = null
+
+  /**
+   * Set when the owning module goes away (JS reload / host teardown). The next module instance
+   * restores the groups from prefs; this queue must not start, persist or report anything after that.
+   */
+  @Volatile private var detached = false
+
+  fun detach() {
+    detached = true
+  }
   private var batchTotal = 0
   private var batchDone = 0
   private var batchFailed = 0
@@ -122,6 +135,7 @@ class GroupQueue(
   // ─── host API ────────────────────────────────────────────────────────────────
 
   fun enqueue(id: String, name: String, tasks: List<Task>, compressValue: Float) {
+    if (detached) return
     synchronized(lock) {
       val existing = groups[id]
       if (existing != null && !existing.isTerminal) {
@@ -166,6 +180,7 @@ class GroupQueue(
 
   /** Stops every running/queued group; finished tasks are kept, nothing is scheduled until [resumeAll]. */
   fun pauseAll() {
+    if (detached) return
     val toStop = mutableListOf<String>()
     synchronized(lock) {
       for (group in groups.values) {
@@ -184,6 +199,7 @@ class GroupQueue(
   }
 
   fun resumeAll() {
+    if (detached) return
     synchronized(lock) {
       for (group in groups.values) {
         if (group.state != STATE_PAUSED) continue
@@ -232,6 +248,11 @@ class GroupQueue(
         groups[group.id] = group
         for (t in group.tasks) taskToGroup[t.id] = group.id
       }
+      if (groups.values.any { !it.isTerminal }) {
+        batchTotal = maxOf(batchTotal, prefs.getInt(KEY_BATCH_TOTAL, 0))
+        batchDone = maxOf(batchDone, prefs.getInt(KEY_BATCH_DONE, 0))
+        batchFailed = maxOf(batchFailed, prefs.getInt(KEY_BATCH_FAILED, 0))
+      }
       RNBackgroundDownloaderModuleImpl.logD(TAG, "restored ${groups.size} group(s)")
     }
     when (prefs.getString(KEY_PENDING_ACTION, null)) {
@@ -246,6 +267,7 @@ class GroupQueue(
   // ─── task callbacks from the download listeners ──────────────────────────────
 
   fun onTaskProgress(taskId: String) {
+    if (detached) return
     val payload = synchronized(lock) {
       val group = groups[taskToGroup[taskId] ?: return] ?: return
       val now = System.currentTimeMillis()
@@ -257,6 +279,7 @@ class GroupQueue(
   }
 
   fun onTaskSettled(taskId: String, success: Boolean) {
+    if (detached) return
     var settledGroup: Group? = null
     synchronized(lock) {
       val group = groups[taskToGroup[taskId] ?: return] ?: return
@@ -318,6 +341,7 @@ class GroupQueue(
   }
 
   private fun schedule() {
+    if (detached) return
     val toStart = mutableListOf<Group>()
     synchronized(lock) {
       var running = groups.values.count { it.state == STATE_RUNNING || it.state == STATE_RETRY_WAIT }
@@ -356,6 +380,7 @@ class GroupQueue(
   }
 
   private fun retryWaitingForNetwork() {
+    if (detached) return
     val toRetry = synchronized(lock) {
       val list = waitingForNetwork.mapNotNull { groups[it] }.filter { it.state == STATE_RETRY_WAIT }
       waitingForNetwork.clear()
@@ -372,11 +397,18 @@ class GroupQueue(
   }
 
   private fun notifyChanged() {
+    if (detached) return
+    // Batch counters survive a restart: acknowledged groups are gone from prefs, so recounting
+    // on restore would shrink "N of M".
+    synchronized(lock) {
+      prefs.edit().putInt(KEY_BATCH_TOTAL, batchTotal).putInt(KEY_BATCH_DONE, batchDone).putInt(KEY_BATCH_FAILED, batchFailed).apply()
+    }
     val cb = onChanged ?: return
     if (Looper.myLooper() == Looper.getMainLooper()) cb() else handler.post(cb)
   }
 
   private fun startAttempt(group: Group) {
+    if (detached) return
     val tasks: List<Task>
     synchronized(lock) {
       if (group.isTerminal || group.state == STATE_PAUSED) return
@@ -410,7 +442,9 @@ class GroupQueue(
     prefs.edit().remove("g:${group.id}").apply()
   }
 
-  private fun emitState(group: Group) = emit("groupState", snapshotOf(group))
+  private fun emitState(group: Group) {
+    if (!detached) emit("groupState", snapshotOf(group))
+  }
 
   private fun snapshotOf(g: Group) = JSONObject().apply {
     put("id", g.id)
@@ -424,6 +458,7 @@ class GroupQueue(
   }
 
   private fun persist(g: Group) {
+    if (detached) return
     val json = JSONObject().apply {
       put("id", g.id)
       put("name", g.name)

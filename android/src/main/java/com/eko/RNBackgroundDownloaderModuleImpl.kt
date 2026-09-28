@@ -285,6 +285,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       stopTask = { taskId -> stopTask(taskId) },
       emit = { event, payload -> getEventEmitter()?.emit(event, jsonToWritableMap(payload)) },
     )
+    // JS reload: the previous module's queue must stop touching the shared state restored below.
+    ResumableDownloadService.groupQueue?.detach()
     ResumableDownloadService.groupQueue = groupQueue
     groupQueue.onChanged = { ResumableDownloadService.instance?.onQueueChanged() }
     groupQueue.restore()
@@ -390,6 +392,9 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   }
 
   fun invalidate() {
+    // The next module instance restores the queue from prefs and owns the downloads.
+    groupQueue.detach()
+    if (ResumableDownloadService.groupQueue === groupQueue) ResumableDownloadService.groupQueue = null
     // Cancel all download notifications when app is closed
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       // Cancel notifications for all known downloads

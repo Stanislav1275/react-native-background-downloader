@@ -587,6 +587,18 @@ class ResumableDownloadService : Service() {
       android.R.drawable.stat_sys_download_done
     }
 
+    // No queue attached (e.g. between two module instances on a JS reload): keep the host's title.
+    if (groupQueue == null && queueTexts["title"] != null) {
+      return NotificationCompat.Builder(this, DownloadConstants.NOTIFICATION_CHANNEL_ID)
+        .setContentTitle(text("title"))
+        .setSmallIcon(android.R.drawable.stat_sys_download)
+        .setPriority(NotificationCompat.PRIORITY_LOW)
+        .setOngoing(true)
+        .setOnlyAlertOnce(true)
+        .setProgress(0, 0, true)
+        .setContentIntent(contentIntent())
+        .build()
+    }
     return NotificationCompat.Builder(this, DownloadConstants.NOTIFICATION_CHANNEL_ID)
       .setContentTitle("Background Download")
       .setContentText(contentText)
