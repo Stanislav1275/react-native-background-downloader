@@ -54,6 +54,9 @@ typedef void (^RNBGDGroupEmit)(NSString *event, NSDictionary *payload);
 
 /// Re-reads persisted groups (process restart). Call before the session delivers delegate callbacks.
 - (void)restore;
+/// The owning module is going away (JS reload): from now on the queue does nothing — no persisting,
+/// no events, no task starts. The next module instance restores the groups from storage.
+- (void)detach;
 /// Called once the session is activated with the ids of the download tasks it still runs.
 - (void)adoptLiveTaskIds:(NSSet<NSString *> *)liveTaskIds;
 /// App is going to be suspended: start every queued group and every pending retry now.

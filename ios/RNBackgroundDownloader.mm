@@ -4,6 +4,7 @@
 #import "RNBGDGroupQueue.h"
 #import <MMKV/MMKV.h>
 #import <React/RCTBridge.h>
+#include <atomic>
 
 #ifdef RCT_NEW_ARCH_ENABLED
 #import <RNBackgroundDownloaderSpec/RNBackgroundDownloaderSpec.h>
@@ -41,6 +42,24 @@ static const NSTimeInterval kCompletionHandlerTimeout = 30.0; // Timeout for com
 
 static CompletionHandler storedCompletionHandler;
 
+@class RNBackgroundDownloader;
+
+/**
+ * The background URLSession lives for the whole process, while the module does not: a JS reload
+ * (dev reload, expo-updates reloadAsync) creates a new module instance. A session keeps its delegate
+ * until invalidated, and invalidating it cancels every transfer — so the delegate is this proxy,
+ * which forwards to whichever instance currently owns the downloads. Between owners, callbacks are
+ * dropped; the next owner adopts the still-running tasks via getTasks.
+ */
+@interface RNBGDSessionDelegateProxy : NSObject <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate>
+@property (atomic, weak) RNBackgroundDownloader *target;
+@end
+
+static NSURLSession *gSession;
+static RNBGDSessionDelegateProxy *gSessionDelegate;
+/// The instance that owns the downloads (and the session); a new instance takes over from it.
+static __weak RNBackgroundDownloader *gOwner;
+
 @implementation RNBackgroundDownloader {
     MMKV *mmkv;
     NSURLSession *urlSession;
@@ -64,6 +83,10 @@ static CompletionHandler storedCompletionHandler;
     BOOL hasListeners;
     // Tracks whether the session has been fully activated (warmed up)
     BOOL isSessionActivated;
+    // Set by -invalidate (JS reload / host teardown). This instance may still be the background
+    // session's delegate for a moment, but its JS runtime is gone: calling its event emitter then is
+    // use-after-free (seen as std::overflow_error "__next_prime overflow" on the delegate queue).
+    std::atomic<bool> isInvalidated;
     // Queue of download operations waiting for session activation
     NSMutableArray<dispatch_block_t> *pendingDownloads;
     // Controls whether debug logs are sent to JS
@@ -165,6 +188,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 }
 
 - (void)sendEventWithName:(NSString *)eventName body:(id)body retryCount:(int)retryCount {
+    if (isInvalidated) return;
     // Check if bridge is available and loaded
     // This prevents crashes on first app install when events fire before JS is ready
     if (self.bridge == nil || !self.bridge.isValid) {
@@ -215,6 +239,12 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         [MMKV initializeMMKV:nil];
         mmkv = [MMKV mmkvWithID:@"RNBackgroundDownloader"];
 
+        // JS reload: the previous instance still runs the downloads. It writes its task map now and
+        // goes quiet, so what is read from MMKV below is current; its session is taken over later.
+        RNBackgroundDownloader *previous = gOwner;
+        if (previous != nil && previous != self) [previous invalidate];
+        gOwner = self;
+
         NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
         NSString *sessionIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
         sessionConfig = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessionIdentifier];
@@ -257,6 +287,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         decodeErrorRetriedIds = [[NSMutableSet alloc] init];
         idToUpdatedHeadersMap = [[NSMutableDictionary alloc] init];
         isSessionActivated = NO;
+        isInvalidated = false;
         pendingDownloads = [[NSMutableArray alloc] init];
 
 #ifdef RCT_NEW_ARCH_ENABLED
@@ -288,14 +319,32 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 
 - (void)dealloc {
     DLog(nil, @"[RNBackgroundDownloader] - [dealloc]");
-    [self unregisterSession];
+    // Not unregisterSession: the session is process-wide and may already belong to a newer instance.
     [self unregisterBridgeListener];
 }
 
 - (void)handleBridgeHotReload:(NSNotification *) note {
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeHotReload]");
-    [self unregisterSession];
+    [self invalidate];
+}
+
+// JS reload (dev reload, expo-updates reloadAsync) or host teardown. Nothing of this instance may
+// reach JS any more (its runtime is gone), and neither it nor its group queue may write state the
+// next instance restores from MMKV. The session is left running: the next instance takes it over.
+- (void)invalidate {
+    @synchronized (sharedLock) {
+        if (isInvalidated) return;
+        [groupQueue detach];
+        [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+        isTaskMapDirty = NO;
+        isInvalidated = true;
+    }
+    if (gSessionDelegate.target == self) gSessionDelegate.target = nil;
+    NSLog(@"[RNBGDGroupQueue] module invalidated: queue detached, session left to the next instance");
     [self unregisterBridgeListener];
+#ifndef RCT_NEW_ARCH_ENABLED
+    if ([RCTEventEmitter instancesRespondToSelector:@selector(invalidate)]) [super invalidate];
+#endif
 }
 
 - (void)lazyRegisterSession {
@@ -303,8 +352,16 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     [self sendDebugLog:@"lazyRegisterSession called" taskId:nil];
     @synchronized (sharedLock) {
         if (urlSession == nil) {
-            [self sendDebugLog:@"lazyRegisterSession: creating new session" taskId:nil];
-            urlSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:self delegateQueue:nil];
+            if (gSessionDelegate == nil) gSessionDelegate = [RNBGDSessionDelegateProxy new];
+            if (gSession == nil) {
+                [self sendDebugLog:@"lazyRegisterSession: creating new session" taskId:nil];
+                gSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:gSessionDelegate delegateQueue:nil];
+            } else {
+                // A JS reload: the previous instance's session keeps its transfers; take it over.
+                [self sendDebugLog:@"lazyRegisterSession: taking over the process session" taskId:nil];
+            }
+            gSessionDelegate.target = self;
+            urlSession = gSession;
             // Activate the session by calling getTasksWithCompletionHandler
             // This forces iOS to fully initialize the background session
             // On fresh installs, the session may not be ready to process tasks immediately
@@ -356,6 +413,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     DLog(nil, @"[RNBackgroundDownloader] - [unregisterSession]");
     if (urlSession) {
         [urlSession invalidateAndCancel];
+        if (urlSession == gSession) gSession = nil;
         urlSession = nil;
     }
     isSessionActivated = NO;
@@ -456,6 +514,8 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 }
 
 - (void)persistTaskMapNow {
+    // After a hand-over the new instance owns the persisted map; a late timer must not overwrite it.
+    if (isInvalidated) return;
     @synchronized (sharedLock) {
         isTaskMapPersistScheduled = NO;
         if (!isTaskMapDirty) return;
@@ -1314,6 +1374,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 // when NSURLSession delegate callbacks fire before JS has registered listeners
 // (e.g., background session delivering completions from a prior app session).
 - (void)safeEmitEvent:(NSString *)eventName value:(id)value {
+    if (isInvalidated) return;
     @synchronized (pendingEmitEvents) {
         if (_eventEmitterCallback) {
             _eventEmitterCallback(std::string([eventName UTF8String]), value);
@@ -1338,6 +1399,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 
 #pragma mark - NSURLSessionDownloadDelegate methods
 - (void)URLSession:(nonnull NSURLSession *)session downloadTask:(nonnull NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(nonnull NSURL *)location {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     RNBGDTaskConfig *taskConfig;
     NSError *error = nil;
     @synchronized (sharedLock) {
@@ -1418,6 +1480,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 }
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didResumeAtOffset:(int64_t)fileOffset expectedbytesTotal:(int64_t)expectedbytesTotal {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     @synchronized (sharedLock) {
         RNBGDTaskConfig *taskConfig = [self configForTask:downloadTask];
         DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didResumeAtOffset]");
@@ -1430,6 +1493,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
     totalBytesWritten:(int64_t)bytesTotalWritten
     totalBytesExpectedToWrite:(int64_t)bytesTotalExpectedToWrite
 {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     @synchronized (sharedLock) {
         RNBGDTaskConfig *taskConfig = [self configForTask:downloadTask];
         if (!taskConfig) {
@@ -1523,7 +1587,9 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     NSString *groupTaskIdToFail = nil;
+    NSString *groupTaskIdToSucceed = nil;
     @synchronized (sharedLock) {
         // Check if this is an upload task first
         RNBGDUploadTaskConfig *uploadTaskConfig = [self uploadConfigForTask:task];
@@ -1538,8 +1604,19 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
             if (taskConfig) {
                 [self sendDebugLog:@"didCompleteWithError: completed without error" taskId:taskConfig.id];
             }
-            return;
+            // A finished group task normally leaves the map in didFinishDownloadingToURL. Still mapped
+            // here = that callback went to the previous module instance during a JS reload hand-over:
+            // settle it from what is on disk, or the group would wait for it forever.
+            if (!error && taskConfig && [groupQueue owns:taskConfig.id]) {
+                BOOL saved = taskConfig.destination != nil && [[NSFileManager defaultManager] fileExistsAtPath:taskConfig.destination];
+                [self removeTaskFromMap:task];
+                if (saved) groupTaskIdToSucceed = taskConfig.id;
+                else groupTaskIdToFail = taskConfig.id;
+            }
         }
+        if (!error || !taskConfig) {
+            // settled below, outside sharedLock
+        } else {
 
         DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didCompleteWithError] error: %@", error);
         [self sendDebugLog:[NSString stringWithFormat:@"didCompleteWithError: error code=%ld, %@", (long)error.code, error.localizedDescription] taskId:taskConfig.id];
@@ -1628,9 +1705,13 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 #endif
             [self removeTaskFromMap:task];
         }
+        }
     }
     if (groupTaskIdToFail) {
         [groupQueue onTaskSettled:groupTaskIdToFail success:NO];
+    }
+    if (groupTaskIdToSucceed) {
+        [groupQueue onTaskSettled:groupTaskIdToSucceed success:YES];
     }
 }
 
@@ -1638,8 +1719,10 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
     DLog(nil, @"[RNBackgroundDownloader] - [URLSessionDidFinishEventsForBackgroundURLSession]");
     // Woken in the background: whatever the queue still holds (retries waiting on a timer that
     // would not fire once suspended) goes to the session before the app is suspended again.
-    [groupQueue flushForBackground];
-    [self persistTaskMapNow];
+    if (!isInvalidated) {
+        [groupQueue flushForBackground];
+        [self persistTaskMapNow];
+    }
     // The group queue does not need JS to finish a batch, so the system's completion handler is
     // called here instead of waiting for the host's completeHandler() (or the 30 s timeout).
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -2141,6 +2224,7 @@ RCT_EXPORT_METHOD(getExistingUploadTasks:(RCTPromiseResolveBlock)resolve rejecte
 
 // Progress tracking for uploads
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didSendBodyData:(int64_t)bytesSent totalBytesSent:(int64_t)totalBytesSent totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     @synchronized (sharedLock) {
         RNBGDUploadTaskConfig *taskConfig = [self uploadConfigForTask:task];
         if (!taskConfig) {
@@ -2205,6 +2289,7 @@ RCT_EXPORT_METHOD(getExistingUploadTasks:(RCTPromiseResolveBlock)resolve rejecte
 
 // Handle response data for uploads
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    if (isInvalidated) return; // a newer module instance owns the downloads now
     @synchronized (sharedLock) {
         // Upload tasks are also data tasks when receiving response
         RNBGDUploadTaskConfig *taskConfig = [self uploadConfigForTask:dataTask];
@@ -2485,5 +2570,27 @@ RCT_EXPORT_METHOD(getExistingUploadTasks:(RCTPromiseResolveBlock)resolve rejecte
     return std::make_shared<facebook::react::NativeRNBackgroundDownloaderSpecJSI>(params);
 }
 #endif
+
+@end
+
+@implementation RNBGDSessionDelegateProxy
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    // Stable answer (NSURLSession may cache it): what the module class implements.
+    return [super respondsToSelector:aSelector] || [RNBackgroundDownloader instancesRespondToSelector:aSelector];
+}
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    RNBackgroundDownloader *target = self.target;
+    return [target respondsToSelector:aSelector] ? target : nil;
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    return [super methodSignatureForSelector:aSelector] ?: [RNBackgroundDownloader instanceMethodSignatureForSelector:aSelector];
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation {
+    // No owner right now (between two module instances): drop the callback.
+}
 
 @end

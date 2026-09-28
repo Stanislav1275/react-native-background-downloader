@@ -1,6 +1,7 @@
 #import "RNBGDGroupQueue.h"
 #import <MMKV/MMKV.h>
 #import <QuartzCore/QuartzCore.h>
+#include <atomic>
 
 static NSString *const kStateQueued = @"queued";
 static NSString *const kStateRunning = @"running";
@@ -61,10 +62,13 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
     NSMutableDictionary<NSString *, RNBGDGroup *> *_groups;
     NSMutableDictionary<NSString *, NSString *> *_taskToGroup;
     NSInteger _nextOrder;
+    /// Set by -detach from the module's invalidate; read on the session delegate / timer queues.
+    std::atomic<bool> _detached;
 }
 
 - (instancetype)initWithStartTask:(RNBGDGroupStartTask)startTask stopTask:(RNBGDGroupStopTask)stopTask emit:(RNBGDGroupEmit)emit {
     if (self = [super init]) {
+        _detached = false;
         _startTask = [startTask copy];
         _stopTask = [stopTask copy];
         _emit = [emit copy];
@@ -106,6 +110,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
 #pragma mark - Host API
 
 - (void)enqueue:(NSDictionary *)spec {
+    if (_detached) return;
     NSString *groupId = spec[@"id"];
     NSArray *tasks = spec[@"tasks"];
     if (![groupId isKindOfClass:[NSString class]] || ![tasks isKindOfClass:[NSArray class]]) return;
@@ -139,7 +144,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
         [self persist:group];
         snapshot = [self snapshotOf:group];
     }
-    _emit(@"groupState", snapshot);
+    [self emitEvent:@"groupState" payload:snapshot];
     [self schedule];
 }
 
@@ -161,7 +166,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
         if (keep) [self persist:group];
         else [self forget:group];
     }
-    _emit(@"groupState", snapshot);
+    [self emitEvent:@"groupState" payload:snapshot];
     for (NSString *taskId in toStop) _stopTask(taskId);
     [self schedule];
 }
@@ -183,7 +188,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
             [snapshots addObject:[self snapshotOf:group]];
         }
     }
-    for (NSDictionary *snapshot in snapshots) _emit(@"groupState", snapshot);
+    for (NSDictionary *snapshot in snapshots) [self emitEvent:@"groupState" payload:snapshot];
     for (NSString *taskId in toStop) _stopTask(taskId);
 }
 
@@ -199,7 +204,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
             [snapshots addObject:[self snapshotOf:group]];
         }
     }
-    for (NSDictionary *snapshot in snapshots) _emit(@"groupState", snapshot);
+    for (NSDictionary *snapshot in snapshots) [self emitEvent:@"groupState" payload:snapshot];
     [self schedule];
 }
 
@@ -293,6 +298,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
 }
 
 - (void)flushForBackground {
+    if (_detached) return;
     NSMutableArray<RNBGDGroup *> *toStart = [NSMutableArray array];
     @synchronized (self) {
         for (NSString *groupId in _order) {
@@ -310,6 +316,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
 #pragma mark - Task callbacks
 
 - (void)onTaskProgress:(NSString *)taskId {
+    if (_detached) return;
     NSDictionary *snapshot;
     @synchronized (self) {
         RNBGDGroup *group = [self groupOfTask:taskId];
@@ -319,10 +326,11 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
         group.lastProgressEmit = now;
         snapshot = [self snapshotOf:group];
     }
-    _emit(@"groupProgress", snapshot);
+    [self emitEvent:@"groupProgress" payload:snapshot];
 }
 
 - (void)onTaskSettled:(NSString *)taskId success:(BOOL)success {
+    if (_detached) return;
     RNBGDGroup *settledGroup = nil;
     @synchronized (self) {
         RNBGDGroup *group = [self groupOfTask:taskId];
@@ -386,11 +394,12 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
             snapshot = [self snapshotOf:group];
         }
     }
-    _emit(@"groupState", snapshot);
+    [self emitEvent:@"groupState" payload:snapshot];
     if ([group isTerminal]) [self schedule];
 }
 
 - (void)schedule {
+    if (_detached) return;
     NSMutableArray<RNBGDGroup *> *toStart = [NSMutableArray array];
     @synchronized (self) {
         NSInteger running = 0;
@@ -410,6 +419,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
 }
 
 - (void)startAttempt:(RNBGDGroup *)group {
+    if (_detached) return;
     NSMutableArray<NSDictionary *> *tasks = [NSMutableArray array];
     CGFloat compressValue;
     NSDictionary *snapshot;
@@ -427,7 +437,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
         [self persist:group];
         snapshot = [self snapshotOf:group];
     }
-    _emit(@"groupState", snapshot);
+    [self emitEvent:@"groupState" payload:snapshot];
     if (tasks.count == 0) {
         [self onAttemptSettled:group];
         return;
@@ -462,7 +472,17 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
     };
 }
 
+- (void)detach {
+    _detached = true;
+}
+
+- (void)emitEvent:(NSString *)event payload:(NSDictionary *)payload {
+    if (_detached) return;
+    _emit(event, payload);
+}
+
 - (void)persist:(RNBGDGroup *)g {
+    if (_detached) return;
     NSDictionary *json = @{
         @"id": g.groupId,
         @"name": g.name ?: g.groupId,
