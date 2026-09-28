@@ -1727,6 +1727,18 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
     resolve([groupQueue snapshots]);
 }
 
+- (void)pauseAllGroups {
+    [groupQueue pauseAll];
+}
+
+- (void)resumeAllGroups {
+    [groupQueue resumeAll];
+}
+
+- (void)cancelAllGroups {
+    [groupQueue cancelAll];
+}
+
 - (void)setGroupQueueConfig:(JS::NativeRNBackgroundDownloader::SpecSetGroupQueueConfigConfig &)config {
     NSMutableDictionary *dict = [NSMutableDictionary dictionary];
     if (config.maxConcurrentGroups().has_value()) dict[@"maxConcurrentGroups"] = @(config.maxConcurrentGroups().value());
@@ -1754,6 +1766,18 @@ RCT_EXPORT_METHOD(acknowledgeGroup:(NSString *)id) {
 
 RCT_EXPORT_METHOD(getGroups:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
     resolve([groupQueue snapshots]);
+}
+
+RCT_EXPORT_METHOD(pauseAllGroups) {
+    [groupQueue pauseAll];
+}
+
+RCT_EXPORT_METHOD(resumeAllGroups) {
+    [groupQueue resumeAll];
+}
+
+RCT_EXPORT_METHOD(cancelAllGroups) {
+    [groupQueue cancelAll];
 }
 
 RCT_EXPORT_METHOD(setGroupQueueConfig:(NSDictionary *)config) {

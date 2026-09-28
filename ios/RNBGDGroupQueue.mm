@@ -8,6 +8,7 @@ static NSString *const kStateRetryWait = @"retrying";
 static NSString *const kStateDone = @"done";
 static NSString *const kStateFailed = @"failed";
 static NSString *const kStateCanceled = @"canceled";
+static NSString *const kStatePaused = @"paused";
 
 static NSString *const kGroupKeyPrefix = @"g:";
 static const CFTimeInterval kProgressEmitMinInterval = 0.3;
@@ -143,6 +144,10 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
 }
 
 - (void)cancel:(NSString *)groupId {
+    [self cancel:groupId keepUntilAck:NO];
+}
+
+- (void)cancel:(NSString *)groupId keepUntilAck:(BOOL)keep {
     NSArray<NSString *> *toStop;
     NSDictionary *snapshot;
     @synchronized (self) {
@@ -150,13 +155,64 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
         if (group == nil || [group isTerminal]) return;
         toStop = group.pending.allObjects;
         [group.pending removeAllObjects];
+        group.attemptToken++;
         group.state = kStateCanceled;
         snapshot = [self snapshotOf:group];
-        [self forget:group];
+        if (keep) [self persist:group];
+        else [self forget:group];
     }
     _emit(@"groupState", snapshot);
     for (NSString *taskId in toStop) _stopTask(taskId);
     [self schedule];
+}
+
+- (void)pauseAll {
+    NSMutableArray<NSString *> *toStop = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray array];
+    @synchronized (self) {
+        for (NSString *groupId in _order) {
+            RNBGDGroup *group = _groups[groupId];
+            if ([group isTerminal] || [group.state isEqualToString:kStatePaused]) continue;
+            [toStop addObjectsFromArray:group.pending.allObjects];
+            [group.pending removeAllObjects];
+            [group.failed removeAllObjects];
+            group.awaitingAdoption = NO;
+            group.attemptToken++;
+            group.state = kStatePaused;
+            [self persist:group];
+            [snapshots addObject:[self snapshotOf:group]];
+        }
+    }
+    for (NSDictionary *snapshot in snapshots) _emit(@"groupState", snapshot);
+    for (NSString *taskId in toStop) _stopTask(taskId);
+}
+
+- (void)resumeAll {
+    NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray array];
+    @synchronized (self) {
+        for (NSString *groupId in _order) {
+            RNBGDGroup *group = _groups[groupId];
+            if (![group.state isEqualToString:kStatePaused]) continue;
+            group.state = kStateQueued;
+            group.attempt = 0;
+            [self persist:group];
+            [snapshots addObject:[self snapshotOf:group]];
+        }
+    }
+    for (NSDictionary *snapshot in snapshots) _emit(@"groupState", snapshot);
+    [self schedule];
+}
+
+- (void)cancelAll {
+    NSArray<NSString *> *ids;
+    @synchronized (self) {
+        NSMutableArray<NSString *> *live = [NSMutableArray array];
+        for (NSString *groupId in _order) {
+            if (![_groups[groupId] isTerminal]) [live addObject:groupId];
+        }
+        ids = live;
+    }
+    for (NSString *groupId in ids) [self cancel:groupId keepUntilAck:YES];
 }
 
 - (void)acknowledge:(NSString *)groupId {
@@ -185,7 +241,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
             if ([group.state isEqualToString:kStateRunning] && group.pending.count > 0) {
                 // Its tasks may still be running (or already finished) in the background session.
                 group.awaitingAdoption = YES;
-            } else if (![group isTerminal]) {
+            } else if (![group isTerminal] && ![group.state isEqualToString:kStatePaused]) {
                 group.state = kStateQueued;
                 [group.pending removeAllObjects];
             }
@@ -358,7 +414,7 @@ static const CFTimeInterval kProgressEmitMinInterval = 0.3;
     CGFloat compressValue;
     NSDictionary *snapshot;
     @synchronized (self) {
-        if ([group isTerminal] || _groups[group.groupId] != group) return;
+        if ([group isTerminal] || [group.state isEqualToString:kStatePaused] || _groups[group.groupId] != group) return;
         group.state = kStateRunning;
         group.attemptToken++;
         for (NSDictionary *t in group.tasks) {

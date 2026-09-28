@@ -285,6 +285,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       stopTask = { taskId -> stopTask(taskId) },
       emit = { event, payload -> getEventEmitter()?.emit(event, jsonToWritableMap(payload)) },
     )
+    ResumableDownloadService.groupQueue = groupQueue
+    groupQueue.onChanged = { ResumableDownloadService.instance?.onQueueChanged() }
     groupQueue.restore()
   }
 
@@ -1272,6 +1274,15 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
   fun cancelGroup(id: String) = groupQueue.cancel(id)
 
+  fun pauseAllGroups() = groupQueue.pauseAll()
+
+  fun resumeAllGroups() {
+    ensureEventEmitterInitialized()
+    groupQueue.resumeAll()
+  }
+
+  fun cancelAllGroups() = groupQueue.cancelAll()
+
   fun acknowledgeGroup(id: String) = groupQueue.acknowledge(id)
 
   fun getGroups(): WritableArray = jsonToWritableArray(groupQueue.snapshots())
@@ -1282,6 +1293,18 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     if (config.hasKey("retryDelaysMs")) {
       val arr = config.getArray("retryDelaysMs")
       if (arr != null && arr.size() > 0) groupQueue.retryDelaysMs = LongArray(arr.size()) { arr.getDouble(it).toLong() }
+    }
+    if (config.hasKey("notificationTexts")) {
+      val texts = config.getMap("notificationTexts")
+      if (texts != null) {
+        val merged = ResumableDownloadService.queueTexts.toMutableMap()
+        val it = texts.keySetIterator()
+        while (it.hasNextKey()) {
+          val key = it.nextKey()
+          texts.getString(key)?.let { v -> merged[key] = v }
+        }
+        ResumableDownloadService.queueTexts = merged
+      }
     }
   }
 

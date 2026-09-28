@@ -3,7 +3,8 @@ import type { DownloadTask } from './DownloadTask'
 import type { Headers } from './types'
 import type { GroupSnapshotEvent } from './NativeRNBackgroundDownloader'
 
-export type GroupState = 'queued' | 'running' | 'retrying' | 'done' | 'failed' | 'canceled'
+/** `paused`: stopped by pauseAll() / the Android notification; keeps finished tasks until resumeAll(). */
+export type GroupState = 'queued' | 'running' | 'retrying' | 'paused' | 'done' | 'failed' | 'canceled'
 
 export interface GroupTaskSpec {
   id: string
@@ -39,6 +40,12 @@ export interface GroupQueueConfig {
   maxRetries?: number
   /** Pause before each retry pass (last value repeats). Default [3000, 10000]. */
   retryDelaysMs?: number[]
+  /**
+   * Android: texts of the download notification (it shows chapters/groups of the current batch and has
+   * pause / resume / cancel actions). Placeholders: {done} {total} {failed} {name}.
+   * Keys: title, progress, paused, finished, finishedWithErrors, resumeOnLaunch, actionPause, actionResume, actionCancel.
+   */
+  notificationTexts?: Record<string, string>
 }
 
 type Listener = (snapshot: GroupSnapshot) => void
@@ -49,6 +56,9 @@ export interface GroupQueueNative {
   acknowledgeGroup?: (id: string) => void
   getGroups?: () => Promise<GroupSnapshot[]>
   setGroupQueueConfig?: (config: GroupQueueConfig) => void
+  pauseAllGroups?: () => void
+  resumeAllGroups?: () => void
+  cancelAllGroups?: () => void
   onGroupState?: (handler: (s: GroupSnapshotEvent) => void) => unknown
   onGroupProgress?: (handler: (s: GroupSnapshotEvent) => void) => unknown
 }
@@ -59,6 +69,9 @@ interface Backend {
   acknowledge (id: string): void
   getAll (): Promise<GroupSnapshot[]>
   configure (config: GroupQueueConfig): void
+  pauseAll (): void
+  resumeAll (): void
+  cancelAll (): void
 }
 
 const stateListeners = new Set<Listener>()
@@ -83,6 +96,9 @@ function createNativeBackend (native: GroupQueueNative & NativeModule): Backend 
     acknowledge: id => native.acknowledgeGroup!(id),
     getAll: () => native.getGroups!(),
     configure: config => native.setGroupQueueConfig!(config),
+    pauseAll: () => native.pauseAllGroups?.(),
+    resumeAll: () => native.resumeAllGroups?.(),
+    cancelAll: () => native.cancelAllGroups?.(),
   }
 }
 
@@ -93,7 +109,7 @@ function createNativeBackend (native: GroupQueueNative & NativeModule): Backend 
 function createJsBackend (createTask: (spec: GroupTaskSpec) => DownloadTask): Backend {
   interface G { spec: GroupSpec, snap: GroupSnapshot, done: Set<string>, pending: Map<string, DownloadTask> }
   const groups = new Map<string, G>()
-  let cfg: Required<GroupQueueConfig> = { maxConcurrentGroups: 1, maxRetries: 2, retryDelaysMs: [3000, 10000] }
+  let cfg: Required<Omit<GroupQueueConfig, 'notificationTexts'>> = { maxConcurrentGroups: 1, maxRetries: 2, retryDelaysMs: [3000, 10000] }
 
   const snap = (g: G): GroupSnapshot => ({ ...g.snap, completed: g.done.size, failedTaskIds: [...g.snap.failedTaskIds] })
   const isTerminal = (s: GroupState) => s === 'done' || s === 'failed' || s === 'canceled'
@@ -109,12 +125,13 @@ function createJsBackend (createTask: (spec: GroupTaskSpec) => DownloadTask): Ba
   }
 
   const settleAttempt = (g: G) => {
+    if (g.snap.state === 'paused') return
     if (g.snap.failedTaskIds.length && g.snap.attempt < cfg.maxRetries) {
       const delay = cfg.retryDelaysMs[g.snap.attempt] ?? cfg.retryDelaysMs[cfg.retryDelaysMs.length - 1] ?? 0
       g.snap.attempt++
       g.snap.state = 'retrying'
       emitState(snap(g))
-      setTimeout(() => startAttempt(g), delay)
+      setTimeout(() => { if (g.snap.state === 'retrying') startAttempt(g) }, delay)
       return
     }
     g.snap.state = g.snap.failedTaskIds.length ? 'failed' : 'done'
@@ -123,7 +140,7 @@ function createJsBackend (createTask: (spec: GroupTaskSpec) => DownloadTask): Ba
   }
 
   const startAttempt = (g: G) => {
-    if (isTerminal(g.snap.state)) return
+    if (isTerminal(g.snap.state) || g.snap.state === 'paused') return
     g.snap.state = 'running'
     g.snap.failedTaskIds = []
     g.snap.failed = 0
@@ -176,8 +193,31 @@ function createJsBackend (createTask: (spec: GroupTaskSpec) => DownloadTask): Ba
     },
     getAll: async () => [...groups.values()].map(snap),
     configure (config) {
-      cfg = { ...cfg, ...Object.fromEntries(Object.entries(config).filter(([, v]) => v !== undefined)) }
+      const { notificationTexts: _texts, ...queueConfig } = config
+      cfg = { ...cfg, ...Object.fromEntries(Object.entries(queueConfig).filter(([, v]) => v !== undefined)) }
       schedule()
+    },
+    pauseAll () {
+      for (const g of groups.values()) {
+        if (isTerminal(g.snap.state) || g.snap.state === 'paused') continue
+        g.snap.state = 'paused'
+        const pending = [...g.pending.values()]
+        g.pending.clear()
+        pending.forEach(t => { t.stop() })
+        emitState(snap(g))
+      }
+    },
+    resumeAll () {
+      for (const g of groups.values()) {
+        if (g.snap.state !== 'paused') continue
+        g.snap.state = 'queued'
+        g.snap.attempt = 0
+        emitState(snap(g))
+      }
+      schedule()
+    },
+    cancelAll () {
+      for (const id of [...groups.keys()]) this.cancel(id)
     },
   }
 }
@@ -210,6 +250,11 @@ export const groupQueue = {
   /** Every group the queue still knows, incl. ones that settled while JS wasn't listening. */
   getAll: () => getBackend().getAll(),
   configure: (config: GroupQueueConfig) => getBackend().configure(config),
+  /** Stops every unfinished group (finished tasks are kept); nothing starts until resumeAll(). */
+  pauseAll: () => getBackend().pauseAll(),
+  resumeAll: () => getBackend().resumeAll(),
+  /** Cancels every unfinished group — each reports `canceled`; the host acknowledges them. */
+  cancelAll: () => getBackend().cancelAll(),
   onState (listener: Listener) {
     stateListeners.add(listener)
     return { remove: () => stateListeners.delete(listener) }

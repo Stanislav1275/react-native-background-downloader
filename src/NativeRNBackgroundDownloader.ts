@@ -164,7 +164,11 @@ export interface Spec extends TurboModule {
     failed: number
     failedTaskIds: Array<string>
   }>>
-  setGroupQueueConfig?(config: { maxConcurrentGroups?: number, maxRetries?: number, retryDelaysMs?: Array<number> }): void
+  setGroupQueueConfig?(config: { maxConcurrentGroups?: number, maxRetries?: number, retryDelaysMs?: Array<number>, notificationTexts?: UnsafeObject }): void
+  // Whole-queue controls (also wired to the Android download notification's actions)
+  pauseAllGroups?(): void
+  resumeAllGroups?(): void
+  cancelAllGroups?(): void
 
   readonly onDownloadBegin: EventEmitter<DownloadBeginEvent>
   readonly onDownloadProgress: EventEmitter<DownloadProgressEvent[]>

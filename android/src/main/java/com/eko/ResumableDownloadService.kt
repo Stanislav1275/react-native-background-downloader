@@ -3,6 +3,7 @@ package com.eko
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -67,6 +68,36 @@ class ResumableDownloadService : Service() {
     const val ACTION_RESUME_DOWNLOAD = "com.eko.action.RESUME_DOWNLOAD"
     const val ACTION_CANCEL_DOWNLOAD = "com.eko.action.CANCEL_DOWNLOAD"
     const val ACTION_STOP_SERVICE = "com.eko.action.STOP_SERVICE"
+    // Notification actions over the whole group queue
+    const val ACTION_PAUSE_ALL = "com.eko.action.PAUSE_ALL"
+    const val ACTION_RESUME_ALL = "com.eko.action.RESUME_ALL"
+    const val ACTION_CANCEL_ALL = "com.eko.action.CANCEL_ALL"
+
+    /** The running service, for queue-change callbacks from the module. */
+    @Volatile var instance: ResumableDownloadService? = null
+      private set
+
+    /** Set by the module: the notification shows the queue's chapters and controls it. */
+    @Volatile var groupQueue: GroupQueue? = null
+
+    /**
+     * Texts for the queue notification, from JS (`setGroupQueueConfig({ notificationTexts })`).
+     * Placeholders: {done} {total} {failed} {name}.
+     */
+    @Volatile var queueTexts: Map<String, String> = mapOf(
+      "title" to "Downloads",
+      "progress" to "{done} of {total}",
+      "paused" to "Paused · {done} of {total}",
+      "finished" to "Downloaded {done} of {total}",
+      "finishedWithErrors" to "Downloaded {done} of {total}, failed {failed}",
+      "resumeOnLaunch" to "Will continue when the app is opened",
+      "actionPause" to "Pause",
+      "actionResume" to "Resume",
+      "actionCancel" to "Cancel",
+    )
+
+    /** Separate id: the paused notification outlives the service (it is not a foreground one). */
+    private const val PAUSED_NOTIFICATION_ID = DownloadConstants.NOTIFICATION_ID + 1
 
     // Extra keys
     const val EXTRA_DOWNLOAD_ID = "download_id"
@@ -204,6 +235,7 @@ class ResumableDownloadService : Service() {
   override fun onCreate() {
     super.onCreate()
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Service created")
+    instance = this
     createNotificationChannel()
   }
 
@@ -261,13 +293,36 @@ class ResumableDownloadService : Service() {
       ACTION_STOP_SERVICE -> {
         stopServiceIfIdle()
       }
+      ACTION_PAUSE_ALL -> onPauseAll()
+      ACTION_RESUME_ALL -> onResumeAll()
+      ACTION_CANCEL_ALL -> onCancelAll()
     }
 
     return START_STICKY
   }
 
+  /**
+   * Android 15+: a dataSync FGS gets 6 h per 24 h. On timeout the service must stop within seconds
+   * or the app crashes — pause the queue instead, so the user can resume it from the notification
+   * (resuming from a notification action starts a fresh foreground window).
+   */
+  override fun onTimeout(startId: Int, fgsType: Int) {
+    RNBackgroundDownloaderModuleImpl.logE(TAG, "FGS timeout (type=$fgsType), pausing the queue")
+    val queue = groupQueue
+    if (queue != null) {
+      queue.pauseAll()
+      stopForPause()
+    } else {
+      releaseWakeLock()
+      stopForeground(STOP_FOREGROUND_REMOVE)
+      isForeground = false
+      stopSelf()
+    }
+  }
+
   override fun onDestroy() {
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Service destroyed")
+    if (instance === this) instance = null
     mainHandler.removeCallbacks(idleStopRunnable)
     releaseWakeLock()
     isForeground = false
@@ -367,6 +422,118 @@ class ResumableDownloadService : Service() {
     return result
   }
 
+  // ─── queue controls (notification actions) ───────────────────────────────────
+
+  private fun onPauseAll() {
+    val queue = groupQueue ?: return stopNowIfIdle()
+    queue.pauseAll()
+    if (!queue.hasActiveWork()) stopForPause()
+  }
+
+  private fun onResumeAll() {
+    notificationManager().cancel(PAUSED_NOTIFICATION_ID)
+    val queue = groupQueue
+    if (queue == null) {
+      // The process died while paused: the queue lives in the RN module, which only the app starts.
+      GroupQueue.setPendingActionStatic(this, GroupQueue.ACTION_RESUME)
+      notificationManager().notify(PAUSED_NOTIFICATION_ID, buildQueueNotification(ongoing = false, textOverride = text("resumeOnLaunch")))
+      stopSelf()
+      return
+    }
+    // Started from a notification action: allowed to go foreground, and must right away.
+    mainHandler.removeCallbacks(idleStopRunnable)
+    startForegroundWithNotification()
+    acquireWakeLock()
+    queue.resumeAll()
+    if (!queue.hasActiveWork()) stopNowIfIdle()
+  }
+
+  private fun onCancelAll() {
+    notificationManager().cancel(PAUSED_NOTIFICATION_ID)
+    val queue = groupQueue
+    if (queue == null) {
+      GroupQueue.setPendingActionStatic(this, GroupQueue.ACTION_CANCEL)
+      stopSelf()
+      return
+    }
+    queue.cancelAll()
+    stopNowIfIdle()
+  }
+
+  /** Paused: no foreground service needed; leave a dismissable notification to resume / cancel from. */
+  private fun stopForPause() {
+    mainHandler.removeCallbacks(idleStopRunnable)
+    releaseWakeLock()
+    if (isForeground) stopForeground(STOP_FOREGROUND_REMOVE)
+    isForeground = false
+    notificationManager().notify(PAUSED_NOTIFICATION_ID, buildQueueNotification(ongoing = false))
+    stopSelf()
+  }
+
+  /** Queue state changed (called by the module on the main thread). */
+  fun onQueueChanged() {
+    val queue = groupQueue ?: return
+    if (queue.summary().paused && !queue.hasActiveWork()) {
+      stopForPause()
+      return
+    }
+    updateNotification(force = true)
+  }
+
+  private fun text(key: String): String = queueTexts[key] ?: ""
+
+  private fun format(template: String, s: GroupQueue.Summary): String =
+    template.replace("{done}", s.done.toString())
+      .replace("{total}", s.total.toString())
+      .replace("{failed}", s.failed.toString())
+      .replace("{name}", s.currentName ?: "")
+
+  private fun actionIntent(action: String, requestCode: Int): PendingIntent =
+    PendingIntent.getService(
+      this, requestCode,
+      Intent(this, ResumableDownloadService::class.java).setAction(action),
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
+  private fun contentIntent(): PendingIntent? {
+    val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return null
+    return PendingIntent.getActivity(this, 0, launch, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+  }
+
+  /** Chapter-level notification driven by the group queue, with pause / resume / cancel. */
+  private fun buildQueueNotification(ongoing: Boolean, textOverride: String? = null): Notification {
+    val s = groupQueue?.summary() ?: GroupQueue.Summary(0, 0, 0, paused = true, active = false, currentName = null)
+    val settled = s.done + s.failed
+    val finished = !s.active && !s.paused
+    val contentText = textOverride ?: when {
+      s.paused -> format(text("paused"), s)
+      finished && s.failed > 0 -> format(text("finishedWithErrors"), s)
+      finished -> format(text("finished"), s)
+      else -> format(text("progress"), s)
+    }
+    val builder = NotificationCompat.Builder(this, DownloadConstants.NOTIFICATION_CHANNEL_ID)
+      .setContentTitle(text("title"))
+      .setContentText(contentText)
+      .setSubText(if (s.active) s.currentName else null)
+      .setSmallIcon(if (s.active) android.R.drawable.stat_sys_download else android.R.drawable.stat_sys_download_done)
+      .setPriority(NotificationCompat.PRIORITY_LOW)
+      .setOnlyAlertOnce(true)
+      .setOngoing(ongoing)
+      .setAutoCancel(!ongoing)
+      .setContentIntent(contentIntent())
+    if (!finished && s.total > 0) builder.setProgress(s.total, settled, false)
+    if (s.active) {
+      builder.addAction(0, text("actionPause"), actionIntent(ACTION_PAUSE_ALL, 1))
+      builder.addAction(0, text("actionCancel"), actionIntent(ACTION_CANCEL_ALL, 3))
+    } else if (s.paused && textOverride == null) {
+      builder.addAction(0, text("actionResume"), actionIntent(ACTION_RESUME_ALL, 2))
+      builder.addAction(0, text("actionCancel"), actionIntent(ACTION_CANCEL_ALL, 3))
+    }
+    return builder.build()
+  }
+
+  private fun notificationManager() = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
   fun isPaused(id: String): Boolean = resumableDownloader.isPaused(id)
 
   fun getState(id: String) = resumableDownloader.getState(id)
@@ -401,6 +568,7 @@ class ResumableDownloadService : Service() {
   }
 
   private fun createNotification(): Notification {
+    if (groupQueue?.summary()?.let { it.total > 0 } == true) return buildQueueNotification(ongoing = true)
     val activeCount = activeDownloads.size
     val pausedCount = activeDownloads.keys.count { resumableDownloader.isPaused(it) }
     val runningCount = activeCount - pausedCount
@@ -430,9 +598,10 @@ class ResumableDownloadService : Service() {
       .build()
   }
 
-  private fun updateNotification() {
+  private fun updateNotification(force: Boolean = false) {
+    if (!isForeground) return
     val now = System.currentTimeMillis()
-    if (now - lastNotificationUpdate < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) return
+    if (!force && now - lastNotificationUpdate < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) return
     lastNotificationUpdate = now
     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.notify(DownloadConstants.NOTIFICATION_ID, createNotification())
@@ -479,12 +648,19 @@ class ResumableDownloadService : Service() {
       updateNotification()
       return
     }
+    // The last task settled: show the final text now, not up to a throttle interval / grace later.
+    updateNotification(force = true)
     mainHandler.removeCallbacks(idleStopRunnable)
     mainHandler.postDelayed(idleStopRunnable, DownloadConstants.IDLE_STOP_GRACE_MS)
   }
 
   private fun stopNowIfIdle() {
-    if (!hasWork()) {
+    val queue = groupQueue
+    if (!hasWork() && queue != null && queue.summary().paused) {
+      stopForPause()
+      return
+    }
+    if (!hasWork() && queue?.hasActiveWork() != true) {
       RNBackgroundDownloaderModuleImpl.logD(TAG, "No active downloads for ${DownloadConstants.IDLE_STOP_GRACE_MS}ms, stopping service")
       releaseWakeLock()
       stopForeground(STOP_FOREGROUND_REMOVE)

@@ -44,6 +44,11 @@ typedef void (^RNBGDGroupEmit)(NSString *event, NSDictionary *payload);
 /// `spec` is {id, name?, compressValue?, tasks: [{id, url, destination, headers?}]}.
 - (void)enqueue:(NSDictionary *)spec;
 - (void)cancel:(NSString *)groupId;
+/// Stops every unfinished group (finished tasks are kept); nothing is scheduled until -resumeAll.
+- (void)pauseAll;
+- (void)resumeAll;
+/// Cancels every unfinished group; the canceled records stay until the host acknowledges them.
+- (void)cancelAll;
 - (void)acknowledge:(NSString *)groupId;
 - (NSArray<NSDictionary *> *)snapshots;
 
@@ -53,7 +58,6 @@ typedef void (^RNBGDGroupEmit)(NSString *event, NSDictionary *payload);
 - (void)adoptLiveTaskIds:(NSSet<NSString *> *)liveTaskIds;
 /// App is going to be suspended: start every queued group and every pending retry now.
 - (void)flushForBackground;
-
 - (void)onTaskProgress:(NSString *)taskId;
 - (void)onTaskSettled:(NSString *)taskId success:(BOOL)success;
 

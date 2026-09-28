@@ -187,4 +187,19 @@ class RNBackgroundDownloaderModule(reactContext: ReactApplicationContext) :
     fun setGroupQueueConfig(config: com.facebook.react.bridge.ReadableMap) {
         impl.setGroupQueueConfig(config)
     }
+
+    @ReactMethod
+    fun pauseAllGroups() {
+        impl.pauseAllGroups()
+    }
+
+    @ReactMethod
+    fun resumeAllGroups() {
+        impl.resumeAllGroups()
+    }
+
+    @ReactMethod
+    fun cancelAllGroups() {
+        impl.cancelAllGroups()
+    }
 }

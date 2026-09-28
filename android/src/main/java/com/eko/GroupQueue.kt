@@ -2,6 +2,9 @@ package com.eko
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
 import org.json.JSONArray
@@ -39,6 +42,8 @@ class GroupQueue(
     val failed: MutableSet<String> = mutableSetOf(),
     /** Tasks started in the current attempt and not settled yet. */
     val pending: MutableSet<String> = mutableSetOf(),
+    /** Bumped on every start / pause / cancel: a delayed retry from an older attempt is dropped. */
+    var token: Int = 0,
   ) {
     val isTerminal get() = state == STATE_DONE || state == STATE_FAILED || state == STATE_CANCELED
   }
@@ -54,11 +59,36 @@ class GroupQueue(
     const val STATE_DONE = "done"
     const val STATE_FAILED = "failed"
     const val STATE_CANCELED = "canceled"
+    /** Stopped by the user (notification / host); keeps finished tasks, not scheduled until resumed. */
+    const val STATE_PAUSED = "paused"
+
+    /** Set by a notification action while the process had no queue (it died while paused). */
+    private const val KEY_PENDING_ACTION = "pending_action"
+    const val ACTION_RESUME = "resume"
+    const val ACTION_CANCEL = "cancel"
+
+    /** A notification action that arrived while no queue existed; applied by the next [restore]. */
+    fun setPendingActionStatic(context: Context, action: String) {
+      context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_PENDING_ACTION, action).apply()
+    }
   }
+
+  /** Chapters of the current batch (since the queue was last idle) — what the notification shows. */
+  data class Summary(val total: Int, val done: Int, val failed: Int, val paused: Boolean, val active: Boolean, val currentName: String?)
+
+  /** Called (main thread) whenever [summary] may have changed. */
+  @Volatile var onChanged: (() -> Unit)? = null
+  private var batchTotal = 0
+  private var batchDone = 0
+  private var batchFailed = 0
 
   private val lock = Any()
   private val prefs: SharedPreferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
   private val handler = Handler(Looper.getMainLooper())
+  private val connectivity = context.getSystemService(ConnectivityManager::class.java)
+  /** Groups whose last attempt failed while offline: retried when a network appears, attempts not spent. */
+  private val waitingForNetwork = LinkedHashSet<String>()
+  private var networkCallbackRegistered = false
 
   /** Insertion-ordered: the queue order is the enqueue order. */
   private val groups = LinkedHashMap<String, Group>()
@@ -74,6 +104,21 @@ class GroupQueue(
 
   fun hasWork(): Boolean = synchronized(lock) { groups.values.any { !it.isTerminal } }
 
+  /** Work that needs the foreground service (paused groups do not). */
+  fun hasActiveWork(): Boolean = synchronized(lock) { groups.values.any { !it.isTerminal && it.state != STATE_PAUSED } }
+
+  fun summary(): Summary = synchronized(lock) {
+    val live = groups.values.filter { !it.isTerminal }
+    Summary(
+      total = batchTotal,
+      done = batchDone,
+      failed = batchFailed,
+      paused = live.isNotEmpty() && live.all { it.state == STATE_PAUSED },
+      active = live.any { it.state != STATE_PAUSED },
+      currentName = live.firstOrNull { it.state == STATE_RUNNING }?.name ?: live.firstOrNull()?.name,
+    )
+  }
+
   // ─── host API ────────────────────────────────────────────────────────────────
 
   fun enqueue(id: String, name: String, tasks: List<Task>, compressValue: Float) {
@@ -84,6 +129,8 @@ class GroupQueue(
         return
       }
       existing?.let { forget(it) }
+      if (groups.values.none { !it.isTerminal }) resetBatch()
+      batchTotal++
       val group = Group(id, name, compressValue, tasks)
       groups[id] = group
       for (t in tasks) taskToGroup[t.id] = id
@@ -93,21 +140,69 @@ class GroupQueue(
     schedule()
   }
 
-  fun cancel(id: String) {
+  /**
+   * @param keepUntilAck keep the canceled record (persisted) until the host [acknowledge]s it — for
+   * cancels the host did not ask for (notification action), so it can clean up after the fact even
+   * if JS was not listening when it happened.
+   */
+  fun cancel(id: String, keepUntilAck: Boolean = false) {
     val toStop: List<String>
     synchronized(lock) {
       val group = groups[id] ?: return
       if (group.isTerminal) return
       toStop = group.pending.toList()
       group.pending.clear()
+      group.token++
       group.state = STATE_CANCELED
+      batchTotal = (batchTotal - 1).coerceAtLeast(batchDone + batchFailed)
       persist(group)
       emitState(group)
-      forget(group)
+      if (!keepUntilAck) forget(group)
     }
     for (taskId in toStop) stopTask(taskId)
     schedule()
+    notifyChanged()
   }
+
+  /** Stops every running/queued group; finished tasks are kept, nothing is scheduled until [resumeAll]. */
+  fun pauseAll() {
+    val toStop = mutableListOf<String>()
+    synchronized(lock) {
+      for (group in groups.values) {
+        if (group.isTerminal || group.state == STATE_PAUSED) continue
+        toStop.addAll(group.pending)
+        group.pending.clear()
+        group.failed.clear()
+        group.token++
+        group.state = STATE_PAUSED
+        persist(group)
+        emitState(group)
+      }
+    }
+    for (taskId in toStop) stopTask(taskId)
+    notifyChanged()
+  }
+
+  fun resumeAll() {
+    synchronized(lock) {
+      for (group in groups.values) {
+        if (group.state != STATE_PAUSED) continue
+        group.state = STATE_QUEUED
+        group.attempt = 0
+        persist(group)
+        emitState(group)
+      }
+    }
+    schedule()
+    notifyChanged()
+  }
+
+  /** User cancel from the notification: records stay until the host acknowledges them. */
+  fun cancelAll() {
+    val ids = synchronized(lock) { groups.values.filter { !it.isTerminal }.map { it.id } }
+    for (id in ids) cancel(id, keepUntilAck = true)
+  }
+
 
   fun acknowledge(id: String) {
     synchronized(lock) {
@@ -127,16 +222,25 @@ class GroupQueue(
       for ((key, raw) in prefs.all) {
         if (!key.startsWith("g:") || raw !is String) continue
         val group = runCatching { fromJson(JSONObject(raw)) }.getOrNull() ?: continue
-        if (!group.isTerminal) {
+        if (!group.isTerminal && group.state != STATE_PAUSED) {
           group.state = STATE_QUEUED
           group.pending.clear()
         }
+        if (!group.isTerminal) batchTotal++
+        else if (group.state == STATE_DONE) { batchTotal++; batchDone++ }
+        else if (group.state == STATE_FAILED) { batchTotal++; batchFailed++ }
         groups[group.id] = group
         for (t in group.tasks) taskToGroup[t.id] = group.id
       }
       RNBackgroundDownloaderModuleImpl.logD(TAG, "restored ${groups.size} group(s)")
     }
+    when (prefs.getString(KEY_PENDING_ACTION, null)) {
+      ACTION_RESUME -> resumeAll()
+      ACTION_CANCEL -> cancelAll()
+    }
+    prefs.edit().remove(KEY_PENDING_ACTION).apply()
     schedule()
+    notifyChanged()
   }
 
   // ─── task callbacks from the download listeners ──────────────────────────────
@@ -179,23 +283,38 @@ class GroupQueue(
   private fun onAttemptSettled(group: Group) {
     synchronized(lock) {
       if (group.isTerminal) return
+      if (group.failed.isNotEmpty() && !isOnline()) {
+        // No network: failures say nothing about the chapter. Hold the slot and retry on reconnect
+        // instead of burning the retry budget (3 s + 10 s) during a longer outage.
+        group.state = STATE_RETRY_WAIT
+        group.token++
+        waitingForNetwork.add(group.id)
+        persist(group)
+        emitState(group)
+        RNBackgroundDownloaderModuleImpl.logD(TAG, "${group.id}: ${group.failed.size} task(s) failed offline, waiting for network")
+        ensureNetworkCallback()
+        return
+      }
       if (group.failed.isNotEmpty() && group.attempt < maxRetries) {
         val delay = retryDelaysMs.getOrElse(group.attempt) { retryDelaysMs.lastOrNull() ?: 0L }
         group.attempt++
+        val token = group.token
         group.state = STATE_RETRY_WAIT
         persist(group)
         emitState(group)
         RNBackgroundDownloaderModuleImpl.logD(TAG, "${group.id}: ${group.failed.size} task(s) failed, retry #${group.attempt} in ${delay}ms")
         // A group waiting for its retry keeps its slot: retries are for transient network loss,
         // starting other groups meanwhile would only fail them too.
-        handler.postDelayed({ startAttempt(group) }, delay)
+        handler.postDelayed({ if (group.token == token) startAttempt(group) }, delay)
         return
       }
       group.state = if (group.failed.isEmpty()) STATE_DONE else STATE_FAILED
+      if (group.state == STATE_DONE) batchDone++ else batchFailed++
       persist(group)
       emitState(group)
     }
     schedule()
+    notifyChanged()
   }
 
   private fun schedule() {
@@ -211,13 +330,58 @@ class GroupQueue(
       }
     }
     for (group in toStart) startAttempt(group)
+    if (toStart.isNotEmpty()) notifyChanged()
+  }
+
+  private fun isOnline(): Boolean {
+    val cm = connectivity ?: return true
+    val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false) ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+  }
+
+  private fun ensureNetworkCallback() {
+    if (networkCallbackRegistered) return
+    val cm = connectivity ?: return
+    try {
+      cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+          // Give the network a moment to become usable (DNS etc.) before hitting the CDN again.
+          handler.postDelayed({ retryWaitingForNetwork() }, 1_500L)
+        }
+      })
+      networkCallbackRegistered = true
+    } catch (e: Exception) {
+      RNBackgroundDownloaderModuleImpl.logE(TAG, "network callback failed: ${e.message}")
+    }
+  }
+
+  private fun retryWaitingForNetwork() {
+    val toRetry = synchronized(lock) {
+      val list = waitingForNetwork.mapNotNull { groups[it] }.filter { it.state == STATE_RETRY_WAIT }
+      waitingForNetwork.clear()
+      list
+    }
+    if (toRetry.isNotEmpty()) RNBackgroundDownloaderModuleImpl.logD(TAG, "network back: retrying ${toRetry.size} group(s)")
+    for (group in toRetry) startAttempt(group)
+  }
+
+  private fun resetBatch() {
+    batchTotal = 0
+    batchDone = 0
+    batchFailed = 0
+  }
+
+  private fun notifyChanged() {
+    val cb = onChanged ?: return
+    if (Looper.myLooper() == Looper.getMainLooper()) cb() else handler.post(cb)
   }
 
   private fun startAttempt(group: Group) {
     val tasks: List<Task>
     synchronized(lock) {
-      if (group.isTerminal) return
+      if (group.isTerminal || group.state == STATE_PAUSED) return
       group.state = STATE_RUNNING
+      group.token++
       tasks = group.tasks.filter { it.id !in group.done }
       group.failed.clear()
       group.pending.clear()

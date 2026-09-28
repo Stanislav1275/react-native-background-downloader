@@ -117,6 +117,18 @@ class RNBackgroundDownloaderModule(reactContext: ReactApplicationContext) :
         impl.setGroupQueueConfig(config)
     }
 
+    override fun pauseAllGroups() {
+        impl.pauseAllGroups()
+    }
+
+    override fun resumeAllGroups() {
+        impl.resumeAllGroups()
+    }
+
+    override fun cancelAllGroups() {
+        impl.cancelAllGroups()
+    }
+
     @ReactMethod
     fun addListener(eventName: String) {
         impl.addListener(eventName)
