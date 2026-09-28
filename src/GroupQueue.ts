@@ -19,6 +19,8 @@ export interface GroupSpec {
   tasks: GroupTaskSpec[]
   /** 0..1 JPEG re-encode quality applied to every finished image (0 = keep as is). */
   compressValue?: number
+  /** Android: local image file (e.g. the title cover) shown as the download notification's large icon. */
+  image?: string
 }
 
 export interface GroupSnapshot {

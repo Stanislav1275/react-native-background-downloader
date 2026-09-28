@@ -150,6 +150,7 @@ export interface Spec extends TurboModule {
     id: string
     name?: string
     compressValue?: number
+    image?: string
     tasks: Array<{ id: string, url: string, destination: string, headers?: UnsafeObject }>
   }): void
   cancelGroup?(id: string): Promise<void>

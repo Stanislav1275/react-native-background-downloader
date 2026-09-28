@@ -521,6 +521,7 @@ class ResumableDownloadService : Service() {
       .setOngoing(ongoing)
       .setAutoCancel(!ongoing)
       .setContentIntent(contentIntent())
+    largeIconFor(s.currentImage)?.let { builder.setLargeIcon(it) }
     if (!finished && s.total > 0) builder.setProgress(s.total, settled, false)
     if (s.active) {
       builder.addAction(0, text("actionPause"), actionIntent(ACTION_PAUSE_ALL, 1))
@@ -530,6 +531,30 @@ class ResumableDownloadService : Service() {
       builder.addAction(0, text("actionCancel"), actionIntent(ACTION_CANCEL_ALL, 3))
     }
     return builder.build()
+  }
+
+  // Large icon cache: the same cover is shown for a whole title, decode it once.
+  private var largeIconPath: String? = null
+  private var largeIcon: android.graphics.Bitmap? = null
+
+  private fun largeIconFor(path: String?): android.graphics.Bitmap? {
+    if (path.isNullOrEmpty()) return null
+    if (path == largeIconPath && largeIcon != null) return largeIcon
+    val file = java.io.File(path.removePrefix("file://"))
+    if (!file.exists()) return null // cover still downloading: try again on the next update
+    val bitmap = try {
+      val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+      android.graphics.BitmapFactory.decodeFile(file.path, bounds)
+      val target = (64 * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+      var sample = 1
+      while (bounds.outWidth / (sample * 2) >= target && bounds.outHeight / (sample * 2) >= target) sample *= 2
+      android.graphics.BitmapFactory.decodeFile(file.path, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
+    } catch (e: Exception) {
+      null
+    } ?: return null
+    largeIconPath = path
+    largeIcon = bitmap
+    return bitmap
   }
 
   private fun notificationManager() = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

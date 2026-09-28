@@ -36,6 +36,8 @@ class GroupQueue(
     val name: String,
     val compressValue: Float,
     val tasks: List<Task>,
+    /** Local image file for the notification (e.g. the title cover); optional. */
+    val image: String? = null,
     var state: String = STATE_QUEUED,
     var attempt: Int = 0,
     val done: MutableSet<String> = mutableSetOf(),
@@ -77,7 +79,10 @@ class GroupQueue(
   }
 
   /** Chapters of the current batch (since the queue was last idle) — what the notification shows. */
-  data class Summary(val total: Int, val done: Int, val failed: Int, val paused: Boolean, val active: Boolean, val currentName: String?)
+  data class Summary(
+    val total: Int, val done: Int, val failed: Int, val paused: Boolean, val active: Boolean,
+    val currentName: String?, val currentImage: String? = null,
+  )
 
   /** Called (main thread) whenever [summary] may have changed. */
   @Volatile var onChanged: (() -> Unit)? = null
@@ -128,13 +133,14 @@ class GroupQueue(
       failed = batchFailed,
       paused = live.isNotEmpty() && live.all { it.state == STATE_PAUSED },
       active = live.any { it.state != STATE_PAUSED },
-      currentName = live.firstOrNull { it.state == STATE_RUNNING }?.name ?: live.firstOrNull()?.name,
+      currentName = (live.firstOrNull { it.state == STATE_RUNNING } ?: live.firstOrNull())?.name,
+      currentImage = (live.firstOrNull { it.state == STATE_RUNNING } ?: live.firstOrNull())?.image,
     )
   }
 
   // ─── host API ────────────────────────────────────────────────────────────────
 
-  fun enqueue(id: String, name: String, tasks: List<Task>, compressValue: Float) {
+  fun enqueue(id: String, name: String, tasks: List<Task>, compressValue: Float, image: String? = null) {
     if (detached) return
     synchronized(lock) {
       val existing = groups[id]
@@ -145,7 +151,7 @@ class GroupQueue(
       existing?.let { forget(it) }
       if (groups.values.none { !it.isTerminal }) resetBatch()
       batchTotal++
-      val group = Group(id, name, compressValue, tasks)
+      val group = Group(id, name, compressValue, tasks, image = image)
       groups[id] = group
       for (t in tasks) taskToGroup[t.id] = id
       persist(group)
@@ -463,6 +469,7 @@ class GroupQueue(
       put("id", g.id)
       put("name", g.name)
       put("compressValue", g.compressValue.toDouble())
+      g.image?.let { put("image", it) }
       put("state", g.state)
       put("attempt", g.attempt)
       put("done", JSONArray(g.done.toList()))
@@ -495,6 +502,7 @@ class GroupQueue(
       name = json.optString("name"),
       compressValue = json.optDouble("compressValue", 0.0).toFloat(),
       tasks = tasks,
+      image = json.optString("image").takeIf { it.isNotEmpty() },
       state = json.optString("state", STATE_QUEUED),
       attempt = json.optInt("attempt", 0),
       done = set("done"),

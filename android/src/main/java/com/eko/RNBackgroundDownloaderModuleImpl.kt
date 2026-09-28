@@ -1274,7 +1274,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       val dest = t.getString("destination") ?: return@mapNotNull null
       GroupQueue.Task(tid, url, dest, HeaderUtils.toMap(if (t.hasKey("headers")) t.getMap("headers") else null))
     }
-    groupQueue.enqueue(id, name, tasks, compress)
+    val image = if (group.hasKey("image")) group.getString("image") else null
+    groupQueue.enqueue(id, name, tasks, compress, image)
   }
 
   fun cancelGroup(id: String) = groupQueue.cancel(id)
